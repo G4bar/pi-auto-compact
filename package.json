@@ -1,0 +1,19 @@
+{
+  "name": "pi-auto-compact",
+  "version": "0.1.0",
+  "description": "pi extension: auto-compact the context when it exceeds a percentage of the active model's window (default 10%).",
+  "keywords": ["pi-package", "pi", "pi-extension", "compaction", "context", "tokens"],
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/G4bar/pi-auto-compact.git"
+  },
+  "files": ["src", "README.md", "LICENSE"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
