@@ -1,16 +1,16 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-// Compatta automaticamente quando il contesto supera PERCENT della finestra del
-// modello attivo (qualunque modello: la soglia si ricalcola dalla sua finestra).
+// Automatically compacts when the context exceeds PERCENT of the active model's
+// window (any model: the threshold is recomputed from its window).
 const DEFAULT_PERCENT = 10;
-// Pavimento: con finestre piccole il 10% sarebbe sotto il prefisso fisso
-// (system prompt + tool ~14k) e darebbe compaction a ogni turno.
+// Floor: with small windows, 10% would fall below the fixed prefix
+// (system prompt + tools ~14k) and trigger compaction on every turn.
 const MIN_THRESHOLD_TOKENS = 40_000;
 
 export default function (pi: ExtensionAPI) {
 	let percent = DEFAULT_PERCENT;
 	let enabled = true;
-	let armed = true; // si riarma solo quando l'uso scende sotto soglia
+	let armed = true; // re-arms only once usage drops back below the threshold
 	let compacting = false;
 
 	const thresholdFor = (contextWindow: number) =>
@@ -34,22 +34,22 @@ export default function (pi: ExtensionAPI) {
 
 		armed = false;
 		compacting = true;
-		notify(ctx, `Auto-compact: ${usage.tokens} token > soglia ${threshold} (${percent}%)`);
+		notify(ctx, `Auto-compact: ${usage.tokens} tokens > threshold ${threshold} (${percent}%)`);
 		ctx.compact({
 			onComplete: () => {
 				compacting = false;
-				notify(ctx, "Auto-compact completata");
+				notify(ctx, "Auto-compact completed");
 			},
 			onError: (error) => {
 				compacting = false;
-				armed = true; // riprova al prossimo turno
-				notify(ctx, `Auto-compact fallita: ${error.message}`, "error");
+				armed = true; // retry on the next turn
+				notify(ctx, `Auto-compact failed: ${error.message}`, "error");
 			},
 		});
 	});
 
 	pi.registerCommand("autocompact", {
-		description: "Auto-compact: /autocompact [percentuale|on|off|status]",
+		description: "Auto-compact: /autocompact [percent|on|off|status]",
 		handler: (args, ctx) => {
 			const arg = args.trim().toLowerCase();
 			if (arg === "off") enabled = false;
@@ -57,7 +57,7 @@ export default function (pi: ExtensionAPI) {
 			else if (arg && arg !== "status") {
 				const n = Number(arg.replace("%", ""));
 				if (!Number.isFinite(n) || n <= 0 || n >= 100) {
-					notify(ctx, "Uso: /autocompact [1-99|on|off|status]", "error");
+					notify(ctx, "Usage: /autocompact [1-99|on|off|status]", "error");
 					return;
 				}
 				percent = n;
@@ -65,8 +65,8 @@ export default function (pi: ExtensionAPI) {
 			}
 			const usage = ctx.getContextUsage();
 			const window = usage?.contextWindow ?? 0;
-			const detail = window ? ` (soglia ${thresholdFor(window)} token su ${window})` : "";
-			notify(ctx, `Auto-compact ${enabled ? "ON" : "OFF"} al ${percent}%${detail}`);
+			const detail = window ? ` (threshold ${thresholdFor(window)} of ${window} tokens)` : "";
+			notify(ctx, `Auto-compact ${enabled ? "ON" : "OFF"} at ${percent}%${detail}`);
 		},
 	});
 }
