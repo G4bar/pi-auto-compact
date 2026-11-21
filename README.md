@@ -1,7 +1,7 @@
 # pi-auto-compact
 
 A tiny extension for [pi](https://pi.dev) (tested on pi 1.6.0) that compacts the context automatically
-once it exceeds a **percentage of the active model's context window** (default **10%**).
+once it exceeds a **percentage of the active model's context window** (default **20%**).
 
 pi's built-in auto-compaction only supports an absolute `reserveTokens`, so a percentage threshold that
 works for every model would need one override per model. This extension computes the threshold from the
@@ -43,8 +43,9 @@ that and compact on every turn. The floor only changes behavior for models with 
 | `/autocompact 15` | set the percentage (1–99) and enable |
 | `/autocompact on` / `off` | enable / disable |
 
-Changes made with the command last for the current session. To change the default, edit
-`DEFAULT_PERCENT` (and, if you need it, `MIN_THRESHOLD_TOKENS`) in `src/index.ts`.
+`/autocompact N` saves the percentage to `~/.pi/agent/auto-compact.json` (`{ "percent": N }`), so it becomes
+the default for all future sessions. `on` / `off` last for the current session only. Without the file the
+built-in default (`DEFAULT_PERCENT` in `src/index.ts`, 20) applies; `MIN_THRESHOLD_TOKENS` is also in that file.
 
 ## Interaction with built-in compaction
 
