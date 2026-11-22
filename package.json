@@ -1,7 +1,7 @@
 {
   "name": "pi-auto-compact",
-  "version": "0.1.0",
-  "description": "pi extension: auto-compact the context when it exceeds a percentage of the active model's window (default 20%).",
+  "version": "0.2.0",
+  "description": "pi extension: auto-compact the context at a percentage of the model's window with a checkpoint that keeps a verbatim record of the conversation, without ever interrupting the running agent.",
   "keywords": ["pi-package", "pi", "pi-extension", "compaction", "context", "tokens"],
   "license": "MIT",
   "type": "module",
@@ -13,7 +13,18 @@
   "pi": {
     "extensions": ["./src/index.ts"]
   },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  },
   "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.6.0",
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
   }
 }
