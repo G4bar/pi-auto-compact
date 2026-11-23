@@ -87,7 +87,7 @@ export default function (pi: ExtensionAPI) {
 			if (built.note) notify(ctx, `Auto-compact: ${built.note}`, "warning");
 			if (built.degraded) notify(ctx, `Auto-compact: model summary failed (${built.degraded}); used the deterministic fallback`, "warning");
 			compacted();
-			guard.compactedAt(event.toolResults.length);
+			guard.compacted();
 			return {
 				entries: [
 					...event.entries,
@@ -111,7 +111,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", () => guard.reset());
 
-	// If the agent goes quiet right after a mid-work compaction, ask it to carry on (once).
+	// If the agent goes quiet right after a compaction, ask it to carry on (once).
+	// Triggered by structure (a text-only turn right after a compaction), not by wording; replies that
+	// hand the conversation back to the user are left alone.
 	pi.on("agent_before_settle", (event) => {
 		const last = event.context.contextMessages.at(-1);
 		if (last?.role !== "assistant") return guard.reset();

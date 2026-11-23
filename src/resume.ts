@@ -2,10 +2,16 @@
  * Safety net for "the agent went quiet right after a compaction".
  *
  * The compaction itself never interrupts the agent (it is applied in place at a turn boundary), but a
- * model that just lost its scrollback sometimes answers "Next: X" and ends the turn without calling a
- * tool. So: when we compact in the middle of work (the turn had tool calls, so the agent was about to go
- * on) we arm the guard; any later turn with tool calls proves the agent resumed and disarms it. If the run
- * is about to settle while still armed, we ask for exactly one continuation.
+ * model that just lost its scrollback often answers with a status line ("Read f3.txt.", "Ready for the
+ * next file") and ends the turn without calling a tool. So: every compaction arms the guard; any later
+ * turn with tool calls proves the agent resumed and disarms it. If the run is about to settle while still
+ * armed, we ask for exactly one continuation.
+ *
+ * The trigger is structural (a text-only turn right after a compaction), not a guess about the wording:
+ * measured stall replies included "Read f3.txt." and a sentence in Chinese, which no phrase list would
+ * catch. The price is that a genuine final answer written right after a compaction is nudged too; the
+ * message tells the agent to repeat it unchanged, so that costs one extra turn. Replies that hand the
+ * conversation back to the user (a question, "let me know") are never nudged.
  */
 export class ResumeGuard {
 	private armed = false;
@@ -15,9 +21,9 @@ export class ResumeGuard {
 		if (toolResultCount > 0) this.armed = false;
 	}
 
-	/** Call when a compaction was appended at a turn that ended with `toolResultCount` tool results. */
-	compactedAt(toolResultCount: number): void {
-		this.armed = toolResultCount > 0;
+	/** Call when a compaction was appended at the end of a turn. */
+	compacted(): void {
+		this.armed = true;
 	}
 
 	/** Call when a new run starts. */
@@ -25,32 +31,21 @@ export class ResumeGuard {
 		this.armed = false;
 	}
 
-	/**
-	 * Call at the final boundary of a run with the agent's last reply. True when one continuation should be
-	 * requested: only if the reply reads like an announced-but-not-taken next step, so a genuine final answer
-	 * is never second-guessed.
-	 */
+	/** Call at the final boundary of a run with the agent's last reply. True when one continuation should be requested. */
 	shouldResume(outcome: "completed" | "aborted" | "error", lastReply: string): boolean {
-		const resume = this.armed && outcome === "completed" && looksUnfinished(lastReply);
+		const resume = this.armed && outcome === "completed" && !handsBackToUser(lastReply);
 		this.armed = false; // at most one nudge per compaction
 		return resume;
 	}
 }
 
-// Phrases that announce an action (English and Italian). Deliberately narrow: a missed stall just behaves
-// as before, while a false positive costs an extra turn and may reword a genuine final answer.
-const INTENT =
-	/\b(next|up next|let me|let's|i'll|i will|i am going to|i'm going to|going to|moving on|proceed(?:ing)?|prossim[oa]|procedo|continuo|passo a|vado a|vediamo|ora (?:leggo|controllo|verifico|procedo|passo|eseguo|lancio))\b/i;
-const NOT_A_STALL = /\b(let me know|fammi sapere|dimmi se)\b/i;
+const ASKS_USER = /\b(let me know|fammi sapere|dimmi se|tell me if)\b/i;
 
-/** Does this final reply read as "about to do something" rather than a finished answer or a question? */
-export function looksUnfinished(reply: string): boolean {
+/** Does this reply give the turn back to the user (a question or an explicit invitation), as opposed to stalling? */
+export function handsBackToUser(reply: string): boolean {
 	const text = reply.trim();
-	if (!text) return true; // an empty reply after a compaction is a stall
-	if (/\?[\s"')\]*_]*$/.test(text)) return false; // asking the user something
-	const tail = text.slice(-200);
-	if (NOT_A_STALL.test(tail)) return false;
-	return /(?::|…|\.\.\.)\s*$/.test(text) || INTENT.test(tail);
+	if (/[?？][\s"')\]*_」）]*$/.test(text)) return true;
+	return ASKS_USER.test(text.slice(-200));
 }
 
 export const RESUME_MESSAGE =

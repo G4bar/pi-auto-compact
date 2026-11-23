@@ -41,10 +41,13 @@ auto-compaction ended the run mid-task. This version appends the compaction as a
 turn boundary** (pi's `turn_end` boundary result), so the agent simply carries on with the compacted context
 on its next request. No abort, no re-prompt.
 
-Safety net: models sometimes lose the thread right after a compaction and answer "Next: X" without calling a
-tool. If that happens right after one of our mid-work compactions, the extension asks for **one**
-continuation (`agent_before_settle`). It only fires when the reply reads like an announced-but-not-taken next
-step; genuine final answers, questions to the user, and aborted runs are left alone. Turn it off with
+Safety net: models sometimes lose the thread right after a compaction and end the turn with a status line
+("Read f3.txt.", "Ready for the next file") instead of calling a tool. If the turn right after one of our
+compactions has no tool call, the extension asks for **one** continuation (`agent_before_settle`). The
+trigger is structural, not a guess about the wording: stall replies seen in testing included a bare
+"Read f3.txt." and a sentence in Chinese. The price is that a genuine final answer written right after a
+compaction is nudged too; the message asks the agent to repeat it unchanged, so that costs one extra turn.
+Questions and invitations ("let me know") to the user, and aborted runs, are never nudged. Turn it off with
 `"resume": false`.
 
 ### Checkpoint
