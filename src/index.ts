@@ -173,6 +173,7 @@ export default function (pi: ExtensionAPI) {
 		const available = ctx.modelRegistry.getAvailable();
 		availableModels = available.map(modelKey).sort();
 		let choice: string | null | undefined; // null = active model, undefined = cancelled
+		let fromMenu = false;
 
 		if (!requested) {
 			if (!ctx.hasUI) {
@@ -187,6 +188,7 @@ export default function (pi: ExtensionAPI) {
 			const picked = await ctx.ui.select("Model that writes the auto-compact summaries", [...options.keys()]);
 			if (picked === undefined) return;
 			choice = options.get(picked);
+			fromMenu = true;
 		} else if (["default", "active", "reset"].includes(requested.toLowerCase())) {
 			choice = null;
 		} else {
@@ -204,6 +206,8 @@ export default function (pi: ExtensionAPI) {
 		const err = saveConfig({ model: choice });
 		if (err) notify(ctx, `Could not save the choice (${err}); applies to this session only`, "error");
 		notify(ctx, `Auto-compact summaries will be written by ${summarizerKey ?? "the active model"}`);
+		// The supported levels depend on the model, so offer the thinking menu right after picking one.
+		if (fromMenu) await chooseThinking(ctx, "", true);
 	}
 
 	/** The model that will write the next summary: the configured one when usable, else the active one. */
@@ -214,7 +218,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/** `/autocompact think [level|session|default]`: no argument opens a menu of the levels the summary model supports. */
-	async function chooseThinking(ctx: ExtensionCommandContext, requested: string): Promise<void> {
+	async function chooseThinking(ctx: ExtensionCommandContext, requested: string, chained = false): Promise<void> {
 		const model = summaryModel(ctx);
 		const supported = model ? getSupportedThinkingLevels(model) : ["off" as const];
 		const session = pi.getThinkingLevel();
@@ -227,6 +231,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (supported.every((level) => level === "off")) {
+				if (chained) return; // nothing to choose; the model notice above is enough
 				notify(ctx, `${model ? modelKey(model) : "The summary model"} does not support thinking, so summaries run without it`);
 				return;
 			}
