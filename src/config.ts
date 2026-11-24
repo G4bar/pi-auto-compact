@@ -17,6 +17,8 @@ export interface Config {
 	resume: boolean;
 	/** Register the `session_recall` tool (config file only). */
 	recall: boolean;
+	/** Write the state summary in the background before the compaction is due (opt-in: only `true` enables it). */
+	precompute: boolean;
 	/** `provider/id` of the model that writes the summaries; undefined = the active model. */
 	model?: string;
 	/** Thinking level of the summary model; undefined = off. */
@@ -48,16 +50,23 @@ export function loadConfig(): Config {
 		minTokens: isTokenCount(raw.minTokens) ? raw.minTokens : DEFAULT_MIN_TOKENS,
 		resume: raw.resume !== false,
 		recall: raw.recall !== false,
+		precompute: raw.precompute === true,
 		model: typeof raw.model === "string" && parseModelKey(raw.model) ? raw.model : undefined,
 		thinking: isThinkingChoice(raw.thinking) ? raw.thinking : undefined,
 	};
 }
 
 /** Persist settings, keeping any other keys; a `model` or `thinking` of null removes the key. Returns an error message on failure. */
-export function saveConfig(patch: { percent?: number; model?: string | null; thinking?: ThinkingChoice | null }): string | undefined {
+export function saveConfig(patch: {
+	percent?: number;
+	model?: string | null;
+	thinking?: ThinkingChoice | null;
+	precompute?: boolean;
+}): string | undefined {
 	try {
 		const next: Json = { ...readJson(configPath()) };
 		if (patch.percent !== undefined) next.percent = patch.percent;
+		if (patch.precompute !== undefined) next.precompute = patch.precompute;
 		if (patch.model === null) delete next.model;
 		else if (patch.model !== undefined) next.model = patch.model;
 		if (patch.thinking === null) delete next.thinking;

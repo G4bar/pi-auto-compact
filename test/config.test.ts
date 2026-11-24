@@ -21,13 +21,23 @@ const write = (path: string, value: unknown) => {
 };
 
 test("loadConfig falls back to defaults, then reads valid values only", () => {
-	assert.deepEqual(loadConfig(), { percent: DEFAULT_PERCENT, minTokens: DEFAULT_MIN_TOKENS, resume: true, recall: true, model: undefined, thinking: undefined });
-	write(join(agentDir, "auto-compact.json"), { percent: 15, minTokens: 5000, resume: false, recall: false, model: "anthropic/claude-haiku-5-5", thinking: "low" });
-	assert.deepEqual(loadConfig(), { percent: 15, minTokens: 5000, resume: false, recall: false, model: "anthropic/claude-haiku-5-5", thinking: "low" });
+	assert.deepEqual(loadConfig(), { percent: DEFAULT_PERCENT, minTokens: DEFAULT_MIN_TOKENS, resume: true, recall: true, precompute: false, model: undefined, thinking: undefined });
+	write(join(agentDir, "auto-compact.json"), { percent: 15, minTokens: 5000, resume: false, recall: false, precompute: true, model: "anthropic/claude-haiku-5-5", thinking: "low" });
+	assert.deepEqual(loadConfig(), { percent: 15, minTokens: 5000, resume: false, recall: false, precompute: true, model: "anthropic/claude-haiku-5-5", thinking: "low" });
 	write(join(agentDir, "auto-compact.json"), { thinking: "session" });
 	assert.equal(loadConfig().thinking, "session");
-	write(join(agentDir, "auto-compact.json"), { percent: 150, minTokens: -1, resume: "no", recall: "no", model: "nope", thinking: "loud" });
-	assert.deepEqual(loadConfig(), { percent: DEFAULT_PERCENT, minTokens: DEFAULT_MIN_TOKENS, resume: true, recall: true, model: undefined, thinking: undefined });
+	write(join(agentDir, "auto-compact.json"), { percent: 150, minTokens: -1, resume: "no", recall: "no", precompute: "yes", model: "nope", thinking: "loud" });
+	assert.deepEqual(loadConfig(), { percent: DEFAULT_PERCENT, minTokens: DEFAULT_MIN_TOKENS, resume: true, recall: true, precompute: false, model: undefined, thinking: undefined });
+});
+
+test("precompute is opt-in: only an explicit true enables it", () => {
+	const file = join(agentDir, "auto-compact.json");
+	for (const value of [false, 1, "true", null, [true]]) {
+		write(file, { precompute: value });
+		assert.equal(loadConfig().precompute, false, JSON.stringify(value));
+	}
+	write(file, { precompute: true });
+	assert.equal(loadConfig().precompute, true);
 });
 
 test("saveConfig keeps the other keys, sets the model and removes it with null", () => {
@@ -44,6 +54,10 @@ test("saveConfig keeps the other keys, sets the model and removes it with null",
 	assert.deepEqual(read(), { minTokens: 5000, percent: 12, thinking: "high" });
 	assert.equal(saveConfig({ thinking: null }), undefined);
 	assert.deepEqual(read(), { minTokens: 5000, percent: 12 });
+	assert.equal(saveConfig({ precompute: true }), undefined);
+	assert.deepEqual(read(), { minTokens: 5000, percent: 12, precompute: true });
+	assert.equal(saveConfig({ precompute: false }), undefined);
+	assert.deepEqual(read(), { minTokens: 5000, percent: 12, precompute: false });
 });
 
 test("isValidPercent", () => {
