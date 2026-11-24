@@ -15,6 +15,8 @@ export interface Config {
 	minTokens: number;
 	/** Ask the agent to continue when it goes quiet right after an auto-compaction. */
 	resume: boolean;
+	/** Register the `session_recall` tool (config file only). */
+	recall: boolean;
 	/** `provider/id` of the model that writes the summaries; undefined = the active model. */
 	model?: string;
 	/** Thinking level of the summary model; undefined = off. */
@@ -45,6 +47,7 @@ export function loadConfig(): Config {
 		percent: isValidPercent(raw.percent) ? raw.percent : DEFAULT_PERCENT,
 		minTokens: isTokenCount(raw.minTokens) ? raw.minTokens : DEFAULT_MIN_TOKENS,
 		resume: raw.resume !== false,
+		recall: raw.recall !== false,
 		model: typeof raw.model === "string" && parseModelKey(raw.model) ? raw.model : undefined,
 		thinking: isThinkingChoice(raw.thinking) ? raw.thinking : undefined,
 	};

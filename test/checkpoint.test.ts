@@ -166,6 +166,25 @@ test("renderCheckpoint points at the transcript, or says it is unrecoverable", (
 	assert.match(renderCheckpoint(baseInput), /not persisted, so removed content cannot be recovered/);
 });
 
+test("renderCheckpoint points at the recall tool, in the recovery text and in the stubs, when it is active", () => {
+	const record: RecordItem[] = [
+		{ k: "u", n: 1, at: 0, text: "", len: 777 },
+		{ k: "a", at: 0, text: "", len: 55 },
+	];
+	const out = renderCheckpoint({ ...baseInput, record, sessionFile: "/tmp/s.jsonl", recallTool: "session_recall" });
+	assert.match(out, /Recovery: Use the session_recall tool/);
+	assert.match(out, /intact in \/tmp\/s\.jsonl/);
+	assert.match(out, /\(body dropped to save space: 777 chars; search it with session_recall\)/);
+	assert.match(out, /\(prose dropped to save space: 55 chars; search it with session_recall\)/);
+	assert.ok(!out.includes("rg -F") && !out.includes("see the transcript"));
+	// not persisted: the tool still reads the in-memory session
+	const ephemeral = renderCheckpoint({ ...baseInput, recallTool: "session_recall" });
+	assert.match(ephemeral, /Use the session_recall tool/);
+	assert.ok(!ephemeral.includes("cannot be recovered"));
+	// without the tool the existing wording stays
+	assert.match(renderCheckpoint({ ...baseInput, record, sessionFile: "/tmp/s.jsonl" }), /rg -F/);
+});
+
 test("renderCheckpoint tells the agent to keep working and includes optional sections only when non-empty", () => {
 	const bare = renderCheckpoint(baseInput);
 	assert.match(bare, /Resume: .*do not restart/);

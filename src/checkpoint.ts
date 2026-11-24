@@ -159,11 +159,14 @@ export interface RenderInput {
 	state: string;
 	readFiles: readonly string[];
 	modifiedFiles: readonly string[];
+	/** Name of the tool that can search and re-read removed entries; when set, recovery points to it instead of the transcript file. */
+	recallTool?: string;
 }
 
 const utcMinute = (ms: number) => `${new Date(ms).toISOString().slice(0, 16).replace("T", " ")}Z`;
 
-function renderRecord(items: readonly RecordItem[]): string {
+function renderRecord(items: readonly RecordItem[], recallTool?: string): string {
+	const where = recallTool ? `search it with ${recallTool}` : "see the transcript";
 	const blocks: string[] = [];
 	for (let i = 0; i < items.length; ) {
 		const item = items[i];
@@ -183,9 +186,9 @@ function renderRecord(items: readonly RecordItem[]): string {
 		}
 		if (item.k === "u") {
 			const head = `[U${item.n} · ${utcMinute(item.at)}]`;
-			blocks.push(item.text ? `${head}\n${item.text}` : `${head} (body dropped to save space: ${item.len} chars; see the transcript)`);
+			blocks.push(item.text ? `${head}\n${item.text}` : `${head} (body dropped to save space: ${item.len} chars; ${where})`);
 		} else {
-			blocks.push(item.text ? `[A]\n${item.text}` : `[A] (prose dropped to save space: ${item.len} chars; see the transcript)`);
+			blocks.push(item.text ? `[A]\n${item.text}` : `[A] (prose dropped to save space: ${item.len} chars; ${where})`);
 		}
 		i++;
 	}
@@ -193,7 +196,10 @@ function renderRecord(items: readonly RecordItem[]): string {
 }
 
 export function renderCheckpoint(input: RenderInput): string {
-	const recovery = input.sessionFile
+	const { recallTool } = input;
+	const recovery = recallTool
+		? `Use the ${recallTool} tool to get removed content back: search by a distinctive string (a file path, an error message, a command) to find entries and their ids, then read one in full by id.${input.sessionFile ? ` The raw transcript is also intact in ${input.sessionFile} (append-only JSONL).` : ""}`
+		: input.sessionFile
 		? `The raw transcript is intact in ${input.sessionFile} (append-only JSONL, one entry per line). To recover exact details, search it for a distinctive string (rg -F or grep -F), then print the matching line (jq . pretty-prints it).`
 		: "This session is not persisted, so removed content cannot be recovered; re-read files and re-run commands if you need them again.";
 
@@ -213,7 +219,7 @@ Recovery: ${recovery}
 Resume: this compaction happened automatically while you were working. Continue from the latest messages below; do not restart, re-plan from scratch, or ask the user to repeat anything unless something is truly missing. Re-run a check before trusting an old result.`,
 	];
 
-	if (input.record.length > 0) parts.push(`## Record (verbatim, oldest first)\n\n${renderRecord(input.record)}`);
+	if (input.record.length > 0) parts.push(`## Record (verbatim, oldest first)\n\n${renderRecord(input.record, recallTool)}`);
 	parts.push(`## State summary\n\n${input.state.trim()}`);
 	if (input.readFiles.length > 0) parts.push(`<read-files>\n${input.readFiles.join("\n")}\n</read-files>`);
 	if (input.modifiedFiles.length > 0) parts.push(`<modified-files>\n${input.modifiedFiles.join("\n")}\n</modified-files>`);

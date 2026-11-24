@@ -124,6 +124,8 @@ export interface BuildInput {
 	sessionThinking?: string;
 	/** Size limit of the verbatim record, in chars. */
 	recordBudgetChars: number;
+	/** Name of the recall tool when it is active; the checkpoint then points to it. */
+	recallTool?: string;
 }
 
 export interface Built {
@@ -147,6 +149,7 @@ export async function buildCheckpoint({
 	thinking,
 	sessionThinking = "off",
 	recordBudgetChars,
+	recallTool,
 }: BuildInput): Promise<Built> {
 	const prev = readPrevious(previous);
 	const facts = extractFacts(messages);
@@ -193,6 +196,7 @@ export async function buildCheckpoint({
 		state,
 		readFiles: files.readFiles,
 		modifiedFiles: files.modifiedFiles,
+		recallTool,
 	});
 	return { summary, usage, degraded, note, details: { ...files, checkpoint: { v: 2, state, record } } };
 }
