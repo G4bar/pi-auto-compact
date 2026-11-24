@@ -1,5 +1,5 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { toolSignature } from "./span.ts";
+import { blocksText, toolSignature, utcMinute } from "./span.ts";
 
 // Recall: look up and re-read session entries that a compaction removed from the context. Everything here
 // is pure (no pi runtime): it works on the entries pi hands to the tool, persisted or not.
@@ -51,8 +51,6 @@ export interface SearchResult {
 const clamp = (value: number | undefined, min: number, max: number, fallback: number) =>
 	typeof value === "number" && Number.isFinite(value) ? Math.min(Math.max(Math.floor(value), min), max) : fallback;
 
-const utcMinute = (ms: number) => `${new Date(ms).toISOString().slice(0, 16).replace("T", " ")}Z`;
-
 /** Tool calls of the assistant messages, by call id, so a tool result can show what was asked. */
 export function buildToolCallIndex(entries: readonly SessionEntry[]): Map<string, ToolCallInfo> {
 	const index = new Map<string, ToolCallInfo>();
@@ -65,17 +63,27 @@ export function buildToolCallIndex(entries: readonly SessionEntry[]): Map<string
 	return index;
 }
 
-function blocksText(content: string | readonly { type: string; text?: string }[]): string {
-	if (typeof content === "string") return content;
-	return content.map((block) => (block.type === "text" ? (block.text ?? "") : block.type === "image" ? "[image]" : `[${block.type}]`)).join("\n");
+/** Find one assistant tool call by id without indexing the whole branch. */
+export function findToolCall(entries: readonly SessionEntry[], toolCallId: string): ToolCallInfo | undefined {
+	for (const entry of entries) {
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		for (const block of entry.message.content) {
+			if (block.type === "toolCall" && block.id === toolCallId) {
+				return { name: block.name, args: block.arguments as Record<string, unknown> };
+			}
+		}
+	}
+	return undefined;
 }
+
+export type ToolCallLookup = ReadonlyMap<string, ToolCallInfo> | ((toolCallId: string) => ToolCallInfo | undefined);
 
 /**
  * What an entry says, in the same scope as the record: user text, assistant prose with one line per tool
  * call (reasoning excluded), tool results labelled with their call. Entries that carry no conversation
  * (compactions, model changes, bash runs hidden from the context, ...) give undefined.
  */
-export function entryText(entry: SessionEntry, toolIndex: ReadonlyMap<string, ToolCallInfo>): EntryText | undefined {
+export function entryText(entry: SessionEntry, toolLookup: ToolCallLookup): EntryText | undefined {
 	const result = (kind: EntryText["kind"], label: string, at: number, text: string): EntryText | undefined =>
 		text.trim() ? { kind, label, at, text } : undefined;
 
@@ -97,7 +105,7 @@ export function entryText(entry: SessionEntry, toolIndex: ReadonlyMap<string, To
 			return result("assistant", "assistant", message.timestamp, lines.join("\n"));
 		}
 		case "toolResult": {
-			const call = toolIndex.get(message.toolCallId);
+			const call = typeof toolLookup === "function" ? toolLookup(message.toolCallId) : toolLookup.get(message.toolCallId);
 			return result("toolResult", toolSignature(call?.name ?? message.toolName, call?.args ?? {}, message.isError), message.timestamp, blocksText(message.content));
 		}
 		case "bashExecution": {
@@ -141,10 +149,14 @@ export function searchEntries(entries: readonly SessionEntry[], visibleIds: Read
 		if (!content) continue;
 
 		const haystack = `${content.label}\n${content.text}`;
+		if (hits.length >= limit) {
+			pattern.lastIndex = 0;
+			if (pattern.test(haystack)) total++;
+			continue;
+		}
 		const found = [...haystack.matchAll(pattern)];
 		if (found.length === 0) continue;
 		total++;
-		if (hits.length >= limit) continue;
 
 		const first = found[0].index;
 		const start = Math.max(0, first - SNIPPET_RADIUS);

@@ -251,7 +251,7 @@ test("e2e: precompute — the summary request starts before the trigger and fini
 		const startIndex = request.atAgentCall - 1; // the turn_end that started the job
 		const entriesAtStart = rig.observed.entries[startIndex] as Parameters<typeof planSpan>[0];
 		const tokensAtStart = rig.observed.tokens[startIndex];
-		const snapshot = createSnapshot(entriesAtStart, { keep: aheadKeep(KEEP_RECENT, tokensAtStart, THRESHOLD), estimate: estimateTokens, settingsKey: "", startedAt: 0 });
+		const snapshot = createSnapshot(entriesAtStart, { keep: aheadKeep(KEEP_RECENT, tokensAtStart, THRESHOLD), estimate: estimateTokens, settingsKey: "" });
 		assert.ok(snapshot);
 		assert.equal(compaction.firstKeptEntryId, snapshot.firstKeptEntryId);
 		const entriesAtTrigger = rig.observed.entries.at(-1) as Parameters<typeof planSpan>[0];

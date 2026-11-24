@@ -15,8 +15,8 @@ import {
 	createSnapshot,
 	growthFor,
 	hashEntries,
+	inLeadWindow,
 	leadFor,
-	shouldStart,
 	validateSnapshot,
 } from "../src/precompute.ts";
 
@@ -57,28 +57,22 @@ test("leadFor is half the growth", () => {
 	assert.equal(leadFor(7), 3);
 });
 
-const start = (over: Partial<Parameters<typeof shouldStart>[0]> = {}) =>
-	shouldStart({ tokens: 36_000, threshold: 40_000, baseline: null, awaitingBaseline: false, growth: 10_000, state: "idle", ...over });
-
-test("shouldStart fires inside the lead window before compactAt", () => {
-	assert.equal(start({ tokens: 35_000 }), false); // exactly compactAt - lead: not yet
-	assert.equal(start({ tokens: 35_001 }), true);
-	assert.equal(start({ tokens: 40_000 }), true); // still not above compactAt
-	assert.equal(start({ tokens: 20_000 }), false);
+test("inLeadWindow is true inside (trigger - lead, trigger] and false outside", () => {
+	// trigger 40_000, growth 10_000 -> lead 5_000 -> window is (35_000, 40_000]
+	assert.equal(inLeadWindow(20_000, 40_000, 10_000), false);
+	assert.equal(inLeadWindow(35_000, 40_000, 10_000), false); // exactly trigger - lead: not yet
+	assert.equal(inLeadWindow(35_001, 40_000, 10_000), true);
+	assert.equal(inLeadWindow(40_000, 40_000, 10_000), true); // still not past trigger
+	assert.equal(inLeadWindow(40_001, 40_000, 10_000), false);
 });
 
-test("shouldStart is false while awaiting the baseline, past compactAt, or while busy/paused/out of budget", () => {
-	assert.equal(start({ awaitingBaseline: true }), false);
-	assert.equal(start({ tokens: 40_001 }), false);
-	for (const state of ["running", "ready", "paused"] as const) assert.equal(start({ state }), false, state);
-	assert.equal(start({ budgetExhausted: true }), false);
-});
-
-test("shouldStart follows the baseline-based compactAt", () => {
-	// baseline 35k + growth 10k: compactAt is 44_999, lead window starts above 39_999
-	assert.equal(start({ baseline: 35_000, tokens: 39_999 }), false);
-	assert.equal(start({ baseline: 35_000, tokens: 40_000 }), true);
-	assert.equal(start({ baseline: 35_000, tokens: 45_000 }), false);
+test("inLeadWindow follows the baseline-based compactAt trigger", () => {
+	// baseline 35k + growth 10k: compactAt is 44_999, lead window is (39_999, 44_999]
+	const trigger = compactAt(40_000, 35_000, 10_000);
+	assert.equal(inLeadWindow(39_999, trigger, 10_000), false);
+	assert.equal(inLeadWindow(40_000, trigger, 10_000), true);
+	assert.equal(inLeadWindow(44_999, trigger, 10_000), true);
+	assert.equal(inLeadWindow(45_000, trigger, 10_000), false);
 });
 
 test("aheadKeep shrinks the kept tail by the distance to the trigger, never below half", () => {
@@ -110,7 +104,7 @@ const history = (): ProjectedSessionEntry[] => [
 ];
 
 const snap = (entries = history(), settingsKey = "m|off|m") => {
-	const s = createSnapshot(entries, { keep: 250, estimate: hundred, settingsKey, startedAt: 7 });
+	const s = createSnapshot(entries, { keep: 250, estimate: hundred, settingsKey });
 	assert.ok(s);
 	return s;
 };
@@ -122,10 +116,9 @@ test("createSnapshot records the span, its entry ids and a fingerprint", () => {
 	assert.equal(s.firstKeptEntryId, "e3");
 	assert.deepEqual(s.entryIds, ["e0", "e1", "e2"]);
 	assert.equal(s.messages.length, 3);
-	assert.equal(s.previousId, undefined);
-	assert.equal(s.startedAt, 7);
+	assert.equal(s.previous, undefined);
 	assert.equal(s.hash, hashEntries(history().slice(0, 3)));
-	assert.equal(createSnapshot(history(), { keep: 10_000, estimate: hundred, settingsKey: "k", startedAt: 0 }), undefined);
+	assert.equal(createSnapshot(history(), { keep: 10_000, estimate: hundred, settingsKey: "k" }), undefined);
 });
 
 test("hashEntries changes when a message or an id changes", () => {
@@ -145,7 +138,7 @@ test("validateSnapshot works after a previous compaction", () => {
 	const summary = { role: "compactionSummary", summary: "old", tokensBefore: 1, timestamp: 1 } as unknown as AgentMessage;
 	const withCompaction = (...rest: ProjectedSessionEntry[]) => [entry("c0", "compaction", summary), msg("k1", user("kept")), ...rest];
 	const s = snap(withCompaction(...history().slice(1)));
-	assert.equal(s.previousId, "c0");
+	assert.equal(s.previous?.id, "c0");
 	assert.deepEqual(check(s, withCompaction(...history().slice(1))), { ok: true });
 	// a newer compaction replaced c0
 	const newer = entry("c1", "compaction", summary);
@@ -471,6 +464,209 @@ test("status reports state, age and the last discard reason", () => {
 	assert.equal(precomputer.status().state, "running");
 	precomputer.discard("model changed");
 	assert.equal(precomputer.status().lastDiscard, "model changed");
+});
+
+test("canStart and hasJob reflect idle, running, ready, paused, and budget-exhausted states", async () => {
+	const { precomputer, calls } = rig({ maxJobsPerCycle: 2, maxFailures: 2 });
+	assert.equal(precomputer.canStart, true);
+	assert.equal(precomputer.hasJob, false);
+
+	precomputer.start(fresh());
+	assert.equal(precomputer.canStart, false);
+	assert.equal(precomputer.hasJob, true);
+
+	calls[0].resolve(generated());
+	await tick();
+	assert.equal(precomputer.state(), "ready");
+	assert.equal(precomputer.canStart, false);
+	assert.equal(precomputer.hasJob, true);
+
+	assert.ok(await precomputer.take());
+	assert.equal(precomputer.canStart, true);
+	assert.equal(precomputer.hasJob, false);
+
+	// spend the remaining job in the cycle
+	precomputer.start(fresh());
+	calls[1].resolve(generated());
+	await tick();
+	assert.ok(await precomputer.take());
+	assert.equal(precomputer.budgetExhausted, true);
+	assert.equal(precomputer.canStart, false);
+	assert.equal(precomputer.hasJob, false);
+
+	// paused state also blocks canStart
+	const pausedRig = rig({ maxJobsPerCycle: 10, maxFailures: 2 });
+	for (let i = 0; i < 2; i++) {
+		pausedRig.precomputer.start(fresh());
+		pausedRig.calls[i].reject(new Error("fail"));
+		await tick();
+	}
+	assert.equal(pausedRig.precomputer.state(), "paused");
+	assert.equal(pausedRig.precomputer.canStart, false);
+	assert.equal(pausedRig.precomputer.hasJob, false);
+});
+
+test("start accepts a per-job runner (including with no constructor runner) and throws when neither is provided", async () => {
+	const precomputer = new Precomputer({});
+	assert.throws(() => precomputer.start(fresh()), /no runner/);
+	assert.equal(precomputer.hasJob, false);
+
+	let received: Snapshot | undefined;
+	const snapshot = fresh();
+	const started = precomputer.start(snapshot, async (s) => {
+		received = s;
+		return generated(11);
+	});
+	assert.equal(started, true);
+	const taken = await precomputer.take();
+	assert.equal(received, snapshot);
+	assert.equal(taken?.generated.usage?.totalTokens, 11);
+
+	// per-job runner overrides constructor runner
+	const { precomputer: withDefault, calls } = rig();
+	let overrideRan = false;
+	assert.equal(
+		withDefault.start(fresh(), async () => {
+			overrideRan = true;
+			return generated(22);
+		}),
+		true,
+	);
+	const takenOverride = await withDefault.take();
+	assert.equal(overrideRan, true);
+	assert.equal(calls.length, 0);
+	assert.equal(takenOverride?.generated.usage?.totalTokens, 22);
+});
+
+test("dropIfInvalid leaves valid jobs intact, discards invalid ones, and returns undefined when idle", async () => {
+	const { precomputer, calls } = rig();
+	assert.equal(precomputer.dropIfInvalid(() => ({ ok: false, reason: "unused" })), undefined);
+
+	precomputer.start(fresh());
+	assert.equal(precomputer.dropIfInvalid(() => ({ ok: true })), undefined);
+	assert.equal(precomputer.state(), "running");
+	assert.equal(calls[0].signal.aborted, false);
+
+	assert.equal(precomputer.dropIfInvalid(() => ({ ok: false, reason: "branch changed" })), "branch changed");
+	assert.equal(precomputer.state(), "idle");
+	assert.equal(calls[0].signal.aborted, true);
+	assert.equal(precomputer.status().lastDiscard, "branch changed");
+});
+
+test("take abort race leaves a ready job unconsumed when signal aborts as the job resolves", async () => {
+	const { precomputer, calls } = rig();
+	precomputer.start(fresh());
+	const controller = new AbortController();
+	const pending = precomputer.take(controller.signal);
+
+	// resolve the runner, let settle() mark the job ready and resolve job.done,
+	// then abort the caller signal before take() resumes from Promise.race
+	calls[0].resolve(generated(13));
+	await Promise.resolve();
+	controller.abort();
+
+	assert.equal(await pending, undefined);
+	assert.equal(precomputer.state(), "ready");
+	assert.equal(precomputer.hasJob, true);
+
+	const taken = await precomputer.take();
+	assert.equal(taken?.generated.usage?.totalTokens, 13);
+	assert.equal(precomputer.hasJob, false);
+});
+
+test("adopt handles idle, ready, wait, pre/post-wait invalidation, abort, and failure", async () => {
+	// idle -> none
+	{
+		const { precomputer } = rig();
+		let waited = false;
+		assert.deepEqual(
+			await precomputer.adopt(() => ({ ok: true }), undefined, () => (waited = true)),
+			{ status: "none" },
+		);
+		assert.equal(waited, false);
+	}
+
+	// adopted ready
+	{
+		const { precomputer, calls } = rig();
+		precomputer.start(fresh());
+		calls[0].resolve(generated(5));
+		await tick();
+		const res = await precomputer.adopt(() => ({ ok: true }));
+		assert.equal(res.status, "adopted");
+		assert.equal(res.taken.waitedMs, 0);
+		assert.equal(res.taken.generated.usage?.totalTokens, 5);
+		assert.equal(precomputer.hasJob, false);
+	}
+
+	// adopted after wait + onWait called
+	{
+		const { precomputer, calls, advance } = rig();
+		precomputer.start(fresh());
+		let waited = 0;
+		const pending = precomputer.adopt(() => ({ ok: true }), undefined, () => waited++);
+		assert.equal(waited, 1);
+		advance(1_200);
+		calls[0].resolve(generated(6));
+		const res = await pending;
+		assert.equal(res.status, "adopted");
+		assert.equal(res.taken.waitedMs, 1_200);
+		assert.equal(res.taken.generated.usage?.totalTokens, 6);
+	}
+
+	// pre-wait invalid does NOT call onWait and discards
+	{
+		const { precomputer, calls } = rig();
+		precomputer.start(fresh());
+		let waited = false;
+		const res = await precomputer.adopt(() => ({ ok: false, reason: "stale before wait" }), undefined, () => (waited = true));
+		assert.deepEqual(res, { status: "discarded", reason: "stale before wait" });
+		assert.equal(waited, false);
+		assert.equal(calls[0].signal.aborted, true);
+		assert.equal(precomputer.hasJob, false);
+	}
+
+	// post-wait invalid discards taken and records usage
+	{
+		const { precomputer, calls } = rig();
+		precomputer.start(fresh());
+		let checks = 0;
+		const pending = precomputer.adopt(() => (++checks === 1 ? { ok: true } : { ok: false, reason: "stale after wait" }));
+		calls[0].resolve(generated(17));
+		const res = await pending;
+		assert.deepEqual(res, { status: "discarded", reason: "stale after wait" });
+		assert.equal(precomputer.hasJob, false);
+		assert.deepEqual(
+			precomputer.drainDiscarded().map((d) => [d.usage.totalTokens, d.reason]),
+			[[17, "stale after wait"]],
+		);
+	}
+
+	// aborted wait returns aborted and keeps ready job intact
+	{
+		const { precomputer, calls } = rig();
+		precomputer.start(fresh());
+		const controller = new AbortController();
+		const pending = precomputer.adopt(() => ({ ok: true }), controller.signal);
+		calls[0].resolve(generated(19));
+		await Promise.resolve();
+		controller.abort();
+		assert.deepEqual(await pending, { status: "aborted" });
+		assert.equal(precomputer.state(), "ready");
+		const later = await precomputer.adopt(() => ({ ok: true }));
+		assert.equal(later.status, "adopted");
+		assert.equal(later.taken.generated.usage?.totalTokens, 19);
+	}
+
+	// failed during wait returns none
+	{
+		const { precomputer, calls } = rig();
+		precomputer.start(fresh());
+		const pending = precomputer.adopt(() => ({ ok: true }));
+		calls[0].reject(new Error("runner failed"));
+		assert.deepEqual(await pending, { status: "none" });
+		assert.equal(precomputer.hasJob, false);
+	}
 });
 
 test("the precomputer leaves no unhandled rejection behind", async () => {

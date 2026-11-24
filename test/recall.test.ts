@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { buildToolCallIndex, entryText, renderEntryPage, renderHits, searchEntries } from "../src/recall.ts";
+import { buildToolCallIndex, entryText, findToolCall, renderEntryPage, renderHits, searchEntries } from "../src/recall.ts";
 
 const text = (t: string) => ({ type: "text", text: t });
 const call = (name: string, args: object, id = "c1") => ({ type: "toolCall", id, name, arguments: args });
@@ -141,4 +141,62 @@ test("renderEntryPage defaults to 12k chars and clamps maxChars to 1k..40k", () 
 	assert.match(renderEntryPage(content, 0, 5), /\[chars 0–1000 of/);
 	assert.match(renderEntryPage(content, 0, 1_000_000), /\[chars 0–40000 of/);
 	assert.match(renderEntryPage(content, -5, Number.NaN), /\[chars 0–12000 of/);
+});
+
+test("custom_message with an invalid timestamp renders with unknown in hits and entry pages", () => {
+	const custom = {
+		type: "custom_message",
+		id: "bad-ts",
+		parentId: null,
+		timestamp: "not-a-timestamp",
+		customType: "note",
+		content: "needle in note",
+		display: true,
+	} as unknown as SessionEntry;
+
+	const content = entryText(custom, new Map());
+	assert.ok(content);
+	assert.ok(Number.isNaN(content.at));
+	assert.match(renderEntryPage(content), /^custom · unknown · note\n\nneedle in note/);
+
+	const found = searchEntries([custom], none, { query: "needle" });
+	assert.ok(typeof found !== "string");
+	assert.equal(found.total, 1);
+	assert.match(renderHits(found.hits, found.total), /\[bad-ts\] unknown · note · 1 match/);
+});
+
+test("searchEntries counts total accurately beyond limit with mixed matching and non-matching entries", () => {
+	const entries = [
+		user("e1", "needle needle needle"),
+		user("e2", "no match here"),
+		user("e3", "NEEDLE again"),
+		user("e4", "still nothing"),
+		user("e5", "needle five"),
+		user("e6", "needle six"),
+	];
+	const found = searchEntries(entries, none, { query: "needle", limit: 2 });
+	assert.ok(typeof found !== "string");
+	assert.deepEqual(found.hits.map((h) => h.id), ["e6", "e5"]);
+	assert.equal(found.total, 4);
+});
+
+test("findToolCall finds a matching call and returns undefined when absent", () => {
+	const entries = [
+		user("e1", "hi"),
+		assistant("e2", [call("read", { path: "a.ts" }, "c1"), call("edit", { path: "b.ts" }, "c2")]),
+		result("e3", "c2", "ok", false),
+	];
+	assert.deepEqual(findToolCall(entries, "c1"), { name: "read", args: { path: "a.ts" } });
+	assert.deepEqual(findToolCall(entries, "c2"), { name: "edit", args: { path: "b.ts" } });
+	assert.equal(findToolCall(entries, "missing"), undefined);
+
+	let lookups = 0;
+	const lookup = (id: string) => {
+		lookups++;
+		return findToolCall(entries, id);
+	};
+	assert.equal(entryText(entries[0], lookup)?.text, "hi");
+	assert.equal(lookups, 0);
+	assert.equal(entryText(entries[2], lookup)?.label, 'edit path="b.ts"');
+	assert.equal(lookups, 1);
 });

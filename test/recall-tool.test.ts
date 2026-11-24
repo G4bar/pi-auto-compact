@@ -122,3 +122,27 @@ test("an entry a context edit omitted counts as removed from the context", async
 		visible = before;
 	}
 });
+
+test("custom_message with an invalid timestamp does not throw on search or read", async () => {
+	branch.push({
+		type: "custom_message",
+		id: "e-bad-ts",
+		parentId: null,
+		timestamp: "invalid-date",
+		customType: "note",
+		content: "UNIQUE_BAD_TS_TOKEN",
+		display: true,
+	} as unknown as SessionEntry);
+	try {
+		const { run } = setup();
+		const searched = await run({ query: "UNIQUE_BAD_TS_TOKEN" });
+		assert.ok(!searched.isError);
+		assert.match(searched.content[0].text, /\[e-bad-ts\] unknown · note/);
+
+		const read = await run({ entryId: "e-bad-ts" });
+		assert.ok(!read.isError);
+		assert.match(read.content[0].text, /^custom · unknown · note/);
+	} finally {
+		branch.pop();
+	}
+});

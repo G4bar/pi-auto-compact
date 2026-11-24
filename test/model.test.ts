@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { chooseSummarizer, isThinkingChoice, modelKey, parseModelKey, resolveThinking } from "../src/model.ts";
+import {
+	type ModelLookup,
+	chooseSummarizer,
+	findConfiguredModel,
+	isThinkingChoice,
+	modelKey,
+	parseModelKey,
+	resolveThinking,
+} from "../src/model.ts";
 
 const model = (provider: string, id: string, contextWindow: number) => ({ provider, id, contextWindow }) as unknown as Model<Api>;
 const active = model("anthropic", "claude-sonnet-5-5", 1_000_000);
@@ -16,6 +24,21 @@ test("parseModelKey splits at the first slash and rejects malformed keys", () =>
 test("modelKey round-trips with parseModelKey", () => {
 	assert.equal(modelKey(cheap), "anthropic/claude-haiku-5-5");
 	assert.deepEqual(parseModelKey(modelKey(cheap)), { provider: "anthropic", id: "claude-haiku-5-5" });
+});
+
+test("findConfiguredModel returns a found model only when it has configured auth", () => {
+	const noAuth = model("openai", "gpt-5", 128_000);
+	const models = [active, cheap, noAuth];
+	const registry: ModelLookup = {
+		find: (provider, id) => models.find((m) => m.provider === provider && m.id === id),
+		hasConfiguredAuth: (m) => m !== noAuth,
+	};
+	assert.equal(findConfiguredModel(registry, "anthropic/claude-haiku-5-5"), cheap);
+	assert.equal(findConfiguredModel(registry, "openai/gpt-5"), undefined);
+	assert.equal(findConfiguredModel(registry, "anthropic/does-not-exist"), undefined);
+	for (const bad of [undefined, "", "nope", "/x", "x/"]) {
+		assert.equal(findConfiguredModel(registry, bad), undefined, String(bad));
+	}
 });
 
 test("chooseSummarizer uses the active model when none is configured", () => {

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ProjectedSessionEntry } from "@earendil-works/pi-coding-agent";
-import { extractFacts, planSpan, toolSignature } from "../src/span.ts";
+import { blocksText, extractFacts, latestCompactionIndex, planSpan, toolSignature, utcMinute } from "../src/span.ts";
 
 const user = (text: string, timestamp = 1): AgentMessage => ({ role: "user", content: text, timestamp });
 const assistant = (...content: object[]): AgentMessage =>
@@ -29,9 +29,11 @@ const history = () => [
 ];
 
 test("planSpan keeps ~keepRecentTokens and summarizes the rest", () => {
-	const span = planSpan(history(), 250, hundred);
+	const entries = history();
+	const span = planSpan(entries, 250, hundred);
 	assert.equal(span?.firstKeptEntryId, "e3");
 	assert.deepEqual(span?.messages.map((m) => m.role), ["user", "assistant", "toolResult"]);
+	assert.deepEqual(span?.covered, entries.slice(0, 3));
 	assert.equal(span?.previous, undefined);
 });
 
@@ -52,9 +54,34 @@ test("planSpan starts after the latest compaction and reports it as previous", (
 	const entries = [compaction, message("k1", user("kept user")), message("k2", assistant(text("kept"))), ...history().slice(3)];
 	const span = planSpan(entries, 250, hundred);
 	assert.equal(span?.previous?.id, "c0");
+	assert.deepEqual(span?.covered.map((e) => e.sourceEntry.id), ["k1", "k2"]);
 	// the compaction summary itself is not re-summarized
 	assert.ok(span?.messages.every((m) => m.role !== "compactionSummary"));
 	assert.equal(span?.messages[0].role, "user");
+});
+
+test("latestCompactionIndex finds the first compaction entry with messages", () => {
+	const summary = { role: "compactionSummary", summary: "old", tokensBefore: 1, timestamp: 1 } as unknown as AgentMessage;
+	assert.equal(latestCompactionIndex([]), -1);
+	assert.equal(latestCompactionIndex([message("e0", user("hi")), entry("c-empty", "compaction")]), -1);
+	assert.equal(
+		latestCompactionIndex([entry("c-empty", "compaction"), message("e0", user("hi")), entry("c1", "compaction", summary), entry("c2", "compaction", summary)]),
+		2,
+	);
+});
+
+test("blocksText returns strings as-is and joins content blocks with newlines", () => {
+	assert.equal(blocksText("plain text"), "plain text");
+	assert.equal(blocksText([text("a"), { type: "text" }, { type: "image" }, text("b")]), "a\n\n[image]\nb");
+	assert.equal(blocksText([]), "");
+});
+
+test("utcMinute formats finite timestamps in UTC and returns \"unknown\" for non-finite values", () => {
+	assert.equal(utcMinute(Date.UTC(2026, 0, 2, 3, 5, 42)), "2026-01-02 03:05Z");
+	assert.equal(utcMinute(0), "1970-01-01 00:00Z");
+	assert.equal(utcMinute(Number.NaN), "unknown");
+	assert.equal(utcMinute(Number.POSITIVE_INFINITY), "unknown");
+	assert.equal(utcMinute(Number.NEGATIVE_INFINITY), "unknown");
 });
 
 test("planSpan ignores entries without model-visible messages", () => {

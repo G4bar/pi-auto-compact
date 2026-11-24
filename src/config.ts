@@ -34,13 +34,35 @@ const isTokenCount = (n: unknown): n is number => typeof n === "number" && Numbe
 
 type Json = Record<string, unknown>;
 
+const isJsonObject = (value: unknown): value is Json =>
+	value !== null && typeof value === "object" && !Array.isArray(value);
+
 function readJson(path: string): Json {
 	try {
 		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Json) : {};
+		return isJsonObject(parsed) ? parsed : {};
 	} catch {
 		return {}; // missing or malformed: fall back to defaults
 	}
+}
+
+function readJsonStrict(path: string): Json {
+	let text: string;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+		throw error;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		throw new Error(`Invalid JSON in ${path}: ${detail}`);
+	}
+	if (!isJsonObject(parsed)) throw new Error(`${path} must contain a JSON object`);
+	return parsed;
 }
 
 export function loadConfig(): Config {
@@ -64,7 +86,8 @@ export function saveConfig(patch: {
 	precompute?: boolean;
 }): string | undefined {
 	try {
-		const next: Json = { ...readJson(configPath()) };
+		const path = configPath();
+		const next: Json = { ...readJsonStrict(path) };
 		if (patch.percent !== undefined) next.percent = patch.percent;
 		if (patch.precompute !== undefined) next.precompute = patch.precompute;
 		if (patch.model === null) delete next.model;
@@ -72,13 +95,13 @@ export function saveConfig(patch: {
 		if (patch.thinking === null) delete next.thinking;
 		else if (patch.thinking !== undefined) next.thinking = patch.thinking;
 		mkdirSync(getAgentDir(), { recursive: true });
-		writeFileSync(configPath(), `${JSON.stringify(next, null, 2)}\n`);
+		writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`);
 	} catch (error) {
 		return error instanceof Error ? error.message : String(error);
 	}
 }
 
-const asObject = (value: unknown): Json => (value && typeof value === "object" ? (value as Json) : {});
+const asObject = (value: unknown): Json => (isJsonObject(value) ? value : {});
 
 /**
  * pi's effective `compaction.keepRecentTokens`: the project file merges over the global one, and a

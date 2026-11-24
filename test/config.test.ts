@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -58,6 +58,28 @@ test("saveConfig keeps the other keys, sets the model and removes it with null",
 	assert.deepEqual(read(), { minTokens: 5000, percent: 12, precompute: true });
 	assert.equal(saveConfig({ precompute: false }), undefined);
 	assert.deepEqual(read(), { minTokens: 5000, percent: 12, precompute: false });
+});
+
+test("saveConfig creates the file when missing, and refuses to overwrite malformed or non-object JSON", () => {
+	const file = join(agentDir, "auto-compact.json");
+	rmSync(file, { force: true });
+	assert.equal(saveConfig({ percent: 25 }), undefined);
+	assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { percent: 25 });
+
+	const broken = '{ "minTokens": 5000, ';
+	writeFileSync(file, broken);
+	const syntaxErr = saveConfig({ percent: 15 });
+	assert.equal(typeof syntaxErr, "string");
+	assert.match(syntaxErr ?? "", /Invalid JSON/);
+	assert.equal(readFileSync(file, "utf8"), broken);
+
+	for (const nonObject of ["[]", "null", '"hello"', "42", "true"]) {
+		writeFileSync(file, nonObject);
+		const err = saveConfig({ percent: 15 });
+		assert.equal(typeof err, "string", nonObject);
+		assert.match(err ?? "", /JSON object/, nonObject);
+		assert.equal(readFileSync(file, "utf8"), nonObject);
+	}
 });
 
 test("isValidPercent", () => {

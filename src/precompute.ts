@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Usage } from "@earendil-works/pi-ai";
-import type { CompactionEntry, ProjectedSessionEntry } from "@earendil-works/pi-coding-agent";
-import { type EstimateTokens, planSpan } from "./span.ts";
+import type { ProjectedSessionEntry } from "@earendil-works/pi-coding-agent";
+import { type EstimateTokens, type Span, latestCompactionIndex, planSpan } from "./span.ts";
 import type { Generated } from "./summarize.ts";
 
 // After a compaction, the next one needs at least this much new context (or a quarter of the
@@ -29,21 +28,8 @@ export const leadFor = (growth: number) => Math.floor(growth / 2);
 
 export type PrecomputeState = "idle" | "running" | "ready" | "paused";
 
-export interface StartInput {
-	tokens: number;
-	threshold: number;
-	baseline: number | null;
-	awaitingBaseline: boolean;
-	growth: number;
-	state: PrecomputeState;
-	/** True when the per-cycle job budget is spent. */
-	budgetExhausted?: boolean;
-}
-
-/** Whether a background job should start now: close to the trigger, but not past it and not while one is busy. */
-export function shouldStart({ tokens, threshold, baseline, awaitingBaseline, growth, state, budgetExhausted = false }: StartInput): boolean {
-	if (awaitingBaseline || budgetExhausted || state !== "idle") return false;
-	const trigger = compactAt(threshold, baseline, growth);
+/** Whether `tokens` is inside the precompute lead window before `trigger` (and not past it). */
+export function inLeadWindow(tokens: number, trigger: number, growth: number): boolean {
 	return tokens > trigger - leadFor(growth) && tokens <= trigger;
 }
 
@@ -59,19 +45,13 @@ export function aheadKeep(keepRecent: number, tokens: number, trigger: number): 
 // Snapshot
 
 /** A span planned ahead of time, with what is needed to check later that it is still valid. */
-export interface Snapshot {
-	/** The compaction the span continues from (undefined = none). */
-	previousId?: string;
+export interface Snapshot extends Omit<Span, "covered"> {
 	/** Context entries replaced by the span (those after `previous`, before `firstKeptEntryId`). */
 	entryIds: string[];
 	/** Fingerprint of those entries' ids and model-visible messages. */
 	hash: string;
-	firstKeptEntryId: string;
-	messages: AgentMessage[];
-	previous?: CompactionEntry;
 	/** `settingsKey(...)` of the summary settings in force when the job started. */
 	settingsKey: string;
-	startedAt: number;
 }
 
 /** sha256 of the ids and messages of `entries`: changes with any `context_edit` on them. */
@@ -81,35 +61,24 @@ export function hashEntries(entries: readonly ProjectedSessionEntry[]): string {
 		.digest("hex");
 }
 
-/** Index of the newest compaction in the projection (it comes first, followed by its retained tail), or -1. */
-const compactionIndex = (entries: readonly ProjectedSessionEntry[]) =>
-	entries.findIndex((e) => e.sourceEntry.type === "compaction" && e.messages.length > 0);
-
 export interface CreateSnapshotInput {
 	/** Tokens to keep verbatim (see `aheadKeep`). */
 	keep: number;
 	estimate: EstimateTokens;
 	settingsKey: string;
-	startedAt: number;
 }
 
 /** Plan the span with `planSpan` and fingerprint it; undefined when there is nothing to compact. */
-export function createSnapshot(entries: readonly ProjectedSessionEntry[], { keep, estimate, settingsKey, startedAt }: CreateSnapshotInput): Snapshot | undefined {
+export function createSnapshot(entries: readonly ProjectedSessionEntry[], { keep, estimate, settingsKey }: CreateSnapshotInput): Snapshot | undefined {
 	const span = planSpan(entries, keep, estimate);
 	if (!span) return undefined;
-	const start = compactionIndex(entries) + 1;
-	const cut = entries.findIndex((e, i) => i >= start && e.sourceEntry.id === span.firstKeptEntryId);
-	if (cut < 0) return undefined;
-	const covered = entries.slice(start, cut);
 	return {
-		previousId: span.previous?.id,
-		entryIds: covered.map((e) => e.sourceEntry.id),
-		hash: hashEntries(covered),
+		entryIds: span.covered.map((e) => e.sourceEntry.id),
+		hash: hashEntries(span.covered),
 		firstKeptEntryId: span.firstKeptEntryId,
 		messages: span.messages,
 		previous: span.previous,
 		settingsKey,
-		startedAt,
 	};
 }
 
@@ -130,9 +99,9 @@ export function validateSnapshot(
 	entries: readonly ProjectedSessionEntry[],
 	{ settingsKey, keepRecent, lead, estimate }: ValidateInput,
 ): Validation {
-	const prevIndex = compactionIndex(entries);
+	const prevIndex = latestCompactionIndex(entries);
 	const currentPrevious = prevIndex >= 0 ? entries[prevIndex].sourceEntry.id : undefined;
-	if (currentPrevious !== snapshot.previousId) return { ok: false, reason: "another compaction happened in between" };
+	if (currentPrevious !== snapshot.previous?.id) return { ok: false, reason: "another compaction happened in between" };
 
 	const after = entries.slice(prevIndex + 1);
 	const n = snapshot.entryIds.length;
@@ -168,10 +137,18 @@ export interface Discarded {
 	model?: string;
 }
 
+export type JobRunner = (snapshot: Snapshot, signal: AbortSignal) => Promise<Generated>;
+
+export type AdoptResult =
+	| { status: "adopted"; taken: Taken }
+	| { status: "discarded"; reason: string }
+	| { status: "aborted" }
+	| { status: "none" };
+
 export interface PrecomputerOptions {
 	/** Writes the state for a snapshot. Must honor `signal`; may reject. */
-	run: (snapshot: Snapshot, signal: AbortSignal) => Promise<Generated>;
-	now: () => number;
+	run?: JobRunner;
+	now?: () => number;
 	deadlineMs?: number;
 	maxJobsPerCycle?: number;
 	/** Consecutive failures that pause the precompute. */
@@ -200,8 +177,7 @@ interface Job {
 	finished: boolean;
 	generated?: Generated;
 	readyAt?: number;
-	discardReason?: string;
-	failReason?: string;
+	endReason?: string;
 	/** Resolves when the job finishes. Never rejects. */
 	done: Promise<void>;
 	finish: () => void;
@@ -212,33 +188,65 @@ interface Job {
  * (no unhandled rejections); a degraded state counts as a failure.
  */
 export class Precomputer {
-	private readonly opts: Required<Omit<PrecomputerOptions, "setTimer" | "clearTimer">> &
-		Pick<PrecomputerOptions, "setTimer" | "clearTimer">;
+	private readonly run: JobRunner | undefined;
+	private readonly now: () => number;
+	private readonly deadlineMs: number;
+	private readonly maxJobsPerCycle: number;
+	private readonly maxFailures: number;
+	private readonly setTimer: (callback: () => void, ms: number) => unknown;
+	private readonly clearTimer: (handle: unknown) => void;
 	private job: Job | undefined;
 	private jobs = 0;
 	private failures = 0;
-	private paused = false;
 	private lastDiscard: string | undefined;
 	private discarded: Discarded[] = [];
 
-	constructor({ deadlineMs = 180_000, maxJobsPerCycle = 2, maxFailures = 2, ...rest }: PrecomputerOptions) {
-		this.opts = { deadlineMs, maxJobsPerCycle, maxFailures, ...rest };
+	constructor({
+		run,
+		now = () => Date.now(),
+		deadlineMs = 180_000,
+		maxJobsPerCycle = 2,
+		maxFailures = 2,
+		setTimer = (callback, ms) => {
+			const handle = setTimeout(callback, ms);
+			handle.unref?.();
+			return handle;
+		},
+		clearTimer = (handle) => clearTimeout(handle as NodeJS.Timeout),
+	}: PrecomputerOptions = {}) {
+		this.run = run;
+		this.now = now;
+		this.deadlineMs = deadlineMs;
+		this.maxJobsPerCycle = maxJobsPerCycle;
+		this.maxFailures = maxFailures;
+		this.setTimer = setTimer;
+		this.clearTimer = clearTimer;
 	}
 
 	state(): PrecomputeState {
 		if (this.job) return this.job.generated ? "ready" : "running";
-		return this.paused ? "paused" : "idle";
+		return this.failures >= this.maxFailures ? "paused" : "idle";
 	}
 
 	/** True when the per-cycle job budget is spent. */
 	get budgetExhausted(): boolean {
-		return this.jobs >= this.opts.maxJobsPerCycle;
+		return this.jobs >= this.maxJobsPerCycle;
+	}
+
+	/** True when a new job can be started right now. */
+	get canStart(): boolean {
+		return this.state() === "idle" && !this.budgetExhausted;
+	}
+
+	/** True when a job is currently running or ready. */
+	get hasJob(): boolean {
+		return this.job !== undefined;
 	}
 
 	status(): PrecomputeStatus {
 		return {
 			state: this.state(),
-			ageMs: this.job ? this.opts.now() - this.job.startedAt : undefined,
+			ageMs: this.job ? this.now() - this.job.startedAt : undefined,
 			lastDiscard: this.lastDiscard,
 			jobsThisCycle: this.jobs,
 			failures: this.failures,
@@ -246,27 +254,38 @@ export class Precomputer {
 	}
 
 	/** Start a job for `snapshot`. False when one is already running/ready, the budget is spent or the precompute is paused. */
-	start(snapshot: Snapshot): boolean {
-		if (this.state() !== "idle" || this.budgetExhausted) return false;
+	start(snapshot: Snapshot, run?: JobRunner): boolean {
+		const runner = run ?? this.run;
+		if (!runner) throw new Error("no runner for precompute job");
+		if (!this.canStart) return false;
 		this.jobs++;
 		const controller = new AbortController();
 		let finish!: () => void;
 		const done = new Promise<void>((resolve) => (finish = resolve));
-		const job: Job = { snapshot, controller, startedAt: this.opts.now(), timer: undefined, finished: false, done, finish };
+		const job: Job = { snapshot, controller, startedAt: this.now(), timer: undefined, finished: false, done, finish };
 		this.job = job;
 
-		const setTimer = this.opts.setTimer ?? ((cb, ms) => {
-			const handle = setTimeout(cb, ms);
-			handle.unref?.();
-			return handle;
-		});
-		job.timer = setTimer(() => this.fail(job, `deadline of ${Math.round(this.opts.deadlineMs / 1000)}s exceeded`, true), this.opts.deadlineMs);
+		job.timer = this.setTimer(
+			() => this.fail(job, `deadline of ${Math.round(this.deadlineMs / 1000)}s exceeded`, true),
+			this.deadlineMs,
+		);
 
-		(async () => this.opts.run(snapshot, controller.signal))().then(
+		(async () => runner(snapshot, controller.signal))().then(
 			(generated) => this.settle(job, generated),
 			(error: unknown) => this.fail(job, error instanceof Error ? error.message : String(error), false),
 		);
 		return true;
+	}
+
+	/** Discard the current job if `validate` rejects its snapshot, returning the rejection reason. */
+	dropIfInvalid(validate: (snapshot: Snapshot) => Validation): string | undefined {
+		if (!this.job) return undefined;
+		const verdict = validate(this.job.snapshot);
+		if (!verdict.ok) {
+			this.discard(verdict.reason);
+			return verdict.reason;
+		}
+		return undefined;
 	}
 
 	/**
@@ -275,24 +294,53 @@ export class Precomputer {
 	 * if the result then turns out not to be adoptable.
 	 */
 	async take(signal?: AbortSignal): Promise<Taken | undefined> {
-		const t0 = this.opts.now();
+		const t0 = this.now();
 		const job = this.job;
 		if (!job || signal?.aborted) return undefined;
 		if (!job.generated) {
-			const stop = new AbortController(); // removes the listener once the wait is over
-			const aborted = new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true, signal: stop.signal }));
-			await Promise.race([job.done, aborted]);
-			stop.abort();
-			if (signal?.aborted && !job.generated) return undefined;
+			if (signal) {
+				const stop = new AbortController(); // removes the listener once the wait is over
+				const aborted = new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true, signal: stop.signal }));
+				await Promise.race([job.done, aborted]);
+				stop.abort();
+			} else {
+				await job.done;
+			}
+			if (signal?.aborted) return undefined;
 		}
 		if (this.job !== job || !job.generated) return undefined;
 		this.job = undefined;
 		return {
 			snapshot: job.snapshot,
 			generated: job.generated,
-			waitedMs: this.opts.now() - t0,
-			preparedMs: (job.readyAt ?? this.opts.now()) - job.startedAt,
+			waitedMs: this.now() - t0,
+			preparedMs: (job.readyAt ?? this.now()) - job.startedAt,
 		};
+	}
+
+	/**
+	 * Validate, wait for (if running), re-validate, and adopt the current job in one step.
+	 * `onWait` runs once a valid job is present, just before taking/awaiting it.
+	 */
+	async adopt(
+		validate: (snapshot: Snapshot) => Validation,
+		signal?: AbortSignal,
+		onWait?: () => void,
+	): Promise<AdoptResult> {
+		if (!this.job) return { status: "none" };
+		const dropped = this.dropIfInvalid(validate);
+		if (dropped !== undefined) return { status: "discarded", reason: dropped };
+		if (signal?.aborted) return { status: "aborted" };
+		onWait?.();
+		const taken = await this.take(signal);
+		if (signal?.aborted) return { status: "aborted" };
+		if (!taken) return { status: "none" };
+		const verdict = validate(taken.snapshot);
+		if (!verdict.ok) {
+			this.discardTaken(taken, verdict.reason);
+			return { status: "discarded", reason: verdict.reason };
+		}
+		return { status: "adopted", taken };
 	}
 
 	/** Abort the job (running or ready), drop it and keep the usage already paid for. */
@@ -301,10 +349,10 @@ export class Precomputer {
 		if (!job) return;
 		this.job = undefined;
 		this.lastDiscard = reason;
-		this.record(job, reason);
+		this.recordUsage(job.generated, reason);
 		if (!job.finished) {
 			job.finished = true;
-			job.discardReason = reason;
+			job.endReason = reason;
 			this.end(job);
 			job.controller.abort();
 		}
@@ -313,7 +361,7 @@ export class Precomputer {
 	/** Account for a taken result that was not adopted (invalid after the wait, or the compaction failed). */
 	discardTaken(taken: Taken, reason: string): void {
 		this.lastDiscard = reason;
-		if (taken.generated.usage) this.discarded.push({ usage: taken.generated.usage, reason, model: taken.generated.model });
+		this.recordUsage(taken.generated, reason);
 	}
 
 	/** Usage of the discarded jobs since the last call, for the `auto-compact-discarded` draft. */
@@ -328,40 +376,35 @@ export class Precomputer {
 		this.discard("a compaction happened");
 		this.jobs = 0;
 		this.failures = 0;
-		this.paused = false;
 	}
 
 	/** Lift the pause (`/autocompact precompute on`). */
 	resume(): void {
 		this.failures = 0;
-		this.paused = false;
 	}
 
 	private end(job: Job): void {
-		if (job.timer !== undefined) (this.opts.clearTimer ?? ((h) => clearTimeout(h as NodeJS.Timeout)))(job.timer);
+		if (job.timer !== undefined) this.clearTimer(job.timer);
 		job.finish();
 	}
 
 	/** Keep the usage of a result nobody will adopt. */
-	private record(job: Job, reason: string): void {
-		const usage = job.generated?.usage;
-		if (usage) this.discarded.push({ usage, reason, model: job.generated?.model });
+	private recordUsage(generated: Generated | undefined, reason: string): void {
+		if (generated?.usage) this.discarded.push({ usage: generated.usage, reason, model: generated.model });
 	}
 
 	private settle(job: Job, generated: Generated): void {
 		if (job.finished) {
 			// ended while the call was in flight (expired or discarded): it still cost money
-			job.generated = generated;
-			this.record(job, job.discardReason ?? job.failReason ?? "discarded");
+			this.recordUsage(generated, job.endReason ?? "discarded");
 			return;
 		}
 		if (generated.degraded) {
-			job.generated = undefined;
 			this.fail(job, generated.degraded, false, generated);
 			return;
 		}
 		job.generated = generated;
-		job.readyAt = this.opts.now();
+		job.readyAt = this.now();
 		job.finished = true;
 		this.failures = 0; // the pause counts consecutive failures
 		this.end(job);
@@ -370,16 +413,12 @@ export class Precomputer {
 	private fail(job: Job, reason: string, expired: boolean, generated?: Generated): void {
 		if (job.finished) return;
 		job.finished = true;
-		job.failReason = reason;
-		if (generated) {
-			job.generated = generated;
-			this.record(job, reason);
-			job.generated = undefined;
-		}
+		job.endReason = reason;
+		this.recordUsage(generated, reason);
 		this.end(job);
 		if (expired) job.controller.abort();
 		if (this.job === job) this.job = undefined;
 		this.lastDiscard = reason;
-		if (++this.failures >= this.opts.maxFailures) this.paused = true;
+		this.failures++;
 	}
 }

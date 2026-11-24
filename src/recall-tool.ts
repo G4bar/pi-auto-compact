@@ -2,7 +2,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { DEFAULT_MAX_BYTES, formatSize, truncateHead } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { RECALL_TOOL_NAME, buildToolCallIndex, entryText, renderEntryPage, renderHits, searchEntries } from "./recall.ts";
+import { RECALL_TOOL_NAME, entryText, findToolCall, renderEntryPage, renderHits, searchEntries } from "./recall.ts";
 
 /** Final safety net: whatever the pages above allow, the tool output never exceeds pi's byte limit. */
 function limitOutput(text: string): string {
@@ -43,7 +43,7 @@ export function registerRecallTool(pi: ExtensionAPI): void {
 				const id = params.entryId.trim();
 				const entry = branch.find((e) => e.id === id);
 				if (!entry) return fail(`No entry "${id}" in the current branch. Find ids with a search (query).`);
-				const content = entryText(entry, buildToolCallIndex(branch));
+				const content = entryText(entry, (toolCallId) => findToolCall(branch, toolCallId));
 				if (!content) return fail(`Entry "${id}" (${entry.type}) has no readable conversation text.`);
 				return ok(renderEntryPage(content, params.offset, params.maxChars));
 			}

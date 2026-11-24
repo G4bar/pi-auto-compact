@@ -86,17 +86,33 @@ test("an abort rejects instead of degrading", async () => {
 	await assert.rejects(buildCheckpoint({ ctx: fakeCtx([failure("aborted")]).ctx, messages, signal: controller.signal, recordBudgetChars: 1000 }));
 });
 
+test("an unavailable configured model preserves its unavailable note when attempt 1 fails", async () => {
+	const { ctx, calls } = fakeCtx([failure("boom"), reply(STATE)]);
+	const generated = await generateStateWithRetry({ ctx, messages, summarizerKey: "x/gone" });
+	assert.deepEqual(calls, ["anthropic/sonnet", "anthropic/sonnet"]);
+	assert.equal(generated.state, STATE);
+	assert.equal(generated.degraded, undefined);
+	assert.match(generated.note ?? "", /summary model x\/gone is unavailable/);
+	assert.doesNotMatch(generated.note ?? "", /summary model x\/gone failed/);
+
+	const degradedCtx = fakeCtx([failure("first"), failure("second")]);
+	const degraded = await generateStateWithRetry({ ctx: degradedCtx.ctx, messages, summarizerKey: "x/gone" });
+	assert.equal(degraded.degraded, "second");
+	assert.match(degraded.note ?? "", /summary model x\/gone is unavailable/);
+	assert.doesNotMatch(degraded.note ?? "", /summary model x\/gone failed/);
+});
+
 test("settingsKey changes with the summary model, thinking level and active model", () => {
 	const thinker = model("anthropic", "thinker", { reasoning: true });
 	const { ctx } = fakeCtx([], { configured: thinker });
-	const base = settingsKey(ctx, undefined, undefined, "off");
-	assert.equal(base, settingsKey(ctx, undefined, undefined, "off"));
-	assert.notEqual(base, settingsKey(ctx, "anthropic/thinker", undefined, "off"));
+	const base = settingsKey(ctx);
+	assert.equal(base, settingsKey(ctx, { sessionThinking: "off" }));
+	assert.notEqual(base, settingsKey(ctx, { summarizerKey: "anthropic/thinker", sessionThinking: "off" }));
 	// "session" follows the session level, but a non-reasoning model resolves to "off" either way
-	assert.equal(settingsKey(ctx, undefined, "session", "high"), base);
-	const withThinking = settingsKey(ctx, "anthropic/thinker", "session", "high");
-	assert.notEqual(withThinking, settingsKey(ctx, "anthropic/thinker", "session", "low"));
-	assert.notEqual(base, settingsKey(fakeCtx([], { active: cheap }).ctx, undefined, undefined, "off"));
+	assert.equal(settingsKey(ctx, { thinking: "session", sessionThinking: "high" }), base);
+	const withThinking = settingsKey(ctx, { summarizerKey: "anthropic/thinker", thinking: "session", sessionThinking: "high" });
+	assert.notEqual(withThinking, settingsKey(ctx, { summarizerKey: "anthropic/thinker", thinking: "session", sessionThinking: "low" }));
+	assert.notEqual(base, settingsKey(fakeCtx([], { active: cheap }).ctx, { sessionThinking: "off" }));
 	// an unknown configured model resolves to the active one, like generation does
-	assert.equal(settingsKey(ctx, "x/gone", undefined, "off"), base);
+	assert.equal(settingsKey(ctx, { summarizerKey: "x/gone", sessionThinking: "off" }), base);
 });

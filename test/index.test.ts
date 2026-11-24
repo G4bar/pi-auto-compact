@@ -454,7 +454,11 @@ test("/autocompact precompute on|off persists, shows in status and completes", a
 	assert.equal(stored().precompute, false);
 	assert.match(rig.notes.at(-1) ?? "", /precompute off/);
 	await rig.command("precompute sideways");
-	assert.match(rig.notes.at(-1) ?? "", /Usage/);
+	assert.match(rig.notes.at(-1) ?? "", /Usage: \/autocompact precompute \[on\|off\]/);
+	assert.equal(stored().precompute, false);
+
+	await rig.command("precompute on extra");
+	assert.match(rig.notes.at(-1) ?? "", /Usage: \/autocompact precompute \[on\|off\]/);
 	assert.equal(stored().precompute, false);
 
 	assert.ok(rig.completions("pre").includes("precompute"));

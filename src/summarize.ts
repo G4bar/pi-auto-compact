@@ -5,7 +5,14 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import type { CompactionEntry, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type CheckpointDetails, buildRecord, capState, mergeFiles, readPrevious, renderCheckpoint } from "./checkpoint.ts";
-import { type ThinkingChoice, chooseSummarizer, modelKey, parseModelKey, resolveThinking } from "./model.ts";
+import {
+	type Summarizer,
+	type ThinkingChoice,
+	chooseSummarizer,
+	findConfiguredModel,
+	modelKey,
+	resolveThinking,
+} from "./model.ts";
 import { extractFacts } from "./span.ts";
 
 const SYSTEM_PROMPT =
@@ -48,45 +55,38 @@ Use exactly this format:
 (exact values, snippets and references needed to continue)${focus ? `\n\nAdditional focus: ${focus}` : ""}`;
 }
 
-function pickSummarizer(ctx: ExtensionContext, active: NonNullable<ExtensionContext["model"]>, summarizerKey: string | undefined, neededTokens: number) {
-	const parsed = summarizerKey ? parseModelKey(summarizerKey) : undefined;
-	const found = parsed ? ctx.modelRegistry.find(parsed.provider, parsed.id) : undefined;
-	const configured = found && ctx.modelRegistry.hasConfiguredAuth(found) ? found : undefined;
-	return chooseSummarizer(summarizerKey, configured, active, neededTokens);
+function pickSummarizer(
+	ctx: ExtensionContext,
+	active: NonNullable<ExtensionContext["model"]>,
+	summarizerKey: string | undefined,
+	neededTokens: number,
+) {
+	return chooseSummarizer(summarizerKey, findConfiguredModel(ctx.modelRegistry, summarizerKey), active, neededTokens);
 }
 
 /**
  * Key of the settings a generated state depends on: the summary model and thinking level that would be used
  * (as resolved now) plus the active model, which is the fallback. A precomputed state is only valid while it is unchanged.
  */
-export function settingsKey(
-	ctx: ExtensionContext,
-	summarizerKey: string | undefined,
-	thinking: ThinkingChoice | undefined,
-	sessionThinking = "off",
-): string {
+export function settingsKey(ctx: ExtensionContext, settings: SummarySettings = {}): string {
 	const active = ctx.model;
 	if (!active) return "no-model";
-	const { model } = pickSummarizer(ctx, active, summarizerKey, 0); // window fit depends on the span, not on the settings
-	const level = resolveThinking(thinking, sessionThinking, getSupportedThinkingLevels(model));
+	const { model } = pickSummarizer(ctx, active, settings.summarizerKey, 0); // window fit depends on the span, not on the settings
+	const level = resolveThinking(settings.thinking, settings.sessionThinking ?? "off", getSupportedThinkingLevels(model));
 	return `${modelKey(model)}|${level}|${modelKey(active)}`;
 }
 
 /** One model call that writes (or updates) the state summary. Throws on any failure. */
 async function generateState(
-	ctx: ExtensionContext,
-	messages: readonly AgentMessage[],
-	previousState: string | undefined,
-	focus: string | undefined,
-	signal: AbortSignal | undefined,
-	summarizerKey: string | undefined,
-	thinking: ThinkingChoice | undefined,
-	sessionThinking: string,
+	{ ctx, messages, previousState, focus, signal, summarizerKey, thinking, sessionThinking = "off" }: GenerateInput,
+	onPick?: (picked: Summarizer) => void,
 ): Promise<{ text: string; usage: Usage; model: string; thinking: string; note?: string }> {
 	if (!ctx.model) throw new Error("no model selected");
 	const prompt = statePrompt(serializeConversation(convertToLlm([...messages])), previousState, focus);
 	const neededTokens = Math.ceil(prompt.length / 3) + MAX_SUMMARY_TOKENS; // ~3 chars/token: deliberately pessimistic
-	const { model, note } = pickSummarizer(ctx, ctx.model, summarizerKey, neededTokens);
+	const picked = pickSummarizer(ctx, ctx.model, summarizerKey, neededTokens);
+	onPick?.(picked);
+	const { model, note } = picked;
 
 	// the chosen level, limited to what this model supports (a non-reasoning model gets none)
 	const level = resolveThinking(thinking, sessionThinking, getSupportedThinkingLevels(model));
@@ -126,7 +126,16 @@ function fallbackState(previousState: string | undefined, reason: string): strin
 		.join("\n\n");
 }
 
-export interface BuildInput {
+export interface SummarySettings {
+	/** `provider/id` configured with `/autocompact model`; undefined = the active model. */
+	summarizerKey?: string;
+	/** Thinking level of the summary model; undefined = off. */
+	thinking?: ThinkingChoice;
+	/** The session's current thinking level, for `thinking: "session"`. */
+	sessionThinking?: string;
+}
+
+export interface BuildInput extends SummarySettings {
 	ctx: ExtensionContext;
 	/** Messages being replaced, oldest first. */
 	messages: readonly AgentMessage[];
@@ -135,12 +144,6 @@ export interface BuildInput {
 	/** Extra focus from `/compact <instructions>`. */
 	focus?: string;
 	signal?: AbortSignal;
-	/** `provider/id` configured with `/autocompact model`; undefined = the active model. */
-	summarizerKey?: string;
-	/** Thinking level of the summary model; undefined = off. */
-	thinking?: ThinkingChoice;
-	/** The session's current thinking level, for `thinking: "session"`. */
-	sessionThinking?: string;
 	/** Size limit of the verbatim record, in chars. */
 	recordBudgetChars: number;
 	/** Name of the recall tool when it is active; the checkpoint then points to it. */
@@ -171,7 +174,7 @@ export interface Generated {
 	thinking?: string;
 }
 
-export interface GenerateInput {
+export interface GenerateInput extends SummarySettings {
 	ctx: ExtensionContext;
 	/** Messages being replaced, oldest first. */
 	messages: readonly AgentMessage[];
@@ -179,35 +182,20 @@ export interface GenerateInput {
 	previousState?: string;
 	focus?: string;
 	signal?: AbortSignal;
-	summarizerKey?: string;
-	thinking?: ThinkingChoice;
-	sessionThinking?: string;
 }
 
 /** Write the state summary, retrying with the active model and degrading to a fallback. Only rejects when `signal` aborts. */
-export async function generateStateWithRetry({
-	ctx,
-	messages,
-	previousState,
-	focus,
-	signal,
-	summarizerKey,
-	thinking,
-	sessionThinking = "off",
-}: GenerateInput): Promise<Generated> {
+export async function generateStateWithRetry(input: GenerateInput): Promise<Generated> {
 	let note: string | undefined;
 	for (let attempt = 1; ; attempt++) {
+		let picked: Summarizer | undefined;
 		try {
 			// a failure with the configured model retries with the active one
 			const generated = await generateState(
-				ctx,
-				messages,
-				previousState,
-				focus,
-				signal,
-				attempt === 1 ? summarizerKey : undefined,
-				thinking,
-				sessionThinking,
+				attempt === 1 ? input : { ...input, summarizerKey: undefined },
+				(p) => {
+					picked = p;
+				},
 			);
 			return {
 				state: generated.text,
@@ -217,11 +205,13 @@ export async function generateStateWithRetry({
 				thinking: generated.thinking,
 			};
 		} catch (error) {
-			if (signal?.aborted) throw error;
+			if (input.signal?.aborted) throw error;
 			const reason = error instanceof Error ? error.message : String(error);
-			if (attempt === 1 && summarizerKey) note = `summary model ${summarizerKey} failed (${reason}); retried with the active model`;
+			if (attempt === 1 && input.summarizerKey && picked) {
+				note = picked.note ?? `summary model ${input.summarizerKey} failed (${reason}); retried with the active model`;
+			}
 			if (attempt < ATTEMPTS) continue;
-			return { state: fallbackState(previousState, reason), degraded: reason, note };
+			return { state: fallbackState(input.previousState, reason), degraded: reason, note };
 		}
 	}
 }

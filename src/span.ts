@@ -7,10 +7,17 @@ export type EstimateTokens = (message: AgentMessage) => number;
 export interface Span {
 	/** Messages to replace, oldest first (a split user-message span is included in full). */
 	messages: AgentMessage[];
+	/** Exact contiguous slice of projected entries replaced by this span. */
+	covered: ProjectedSessionEntry[];
 	/** First entry that stays verbatim after the checkpoint. */
 	firstKeptEntryId: string;
 	/** Latest compaction this span continues from, if any. */
 	previous?: CompactionEntry;
+}
+
+/** Index of the latest compaction entry with a rendered summary in the projected entries, or -1. */
+export function latestCompactionIndex(entries: readonly ProjectedSessionEntry[]): number {
+	return entries.findIndex((e) => e.sourceEntry.type === "compaction" && e.messages.length > 0);
 }
 
 // Same rule as pi: a cut may land on any model-visible message except a tool result,
@@ -29,7 +36,7 @@ export function planSpan(
 	estimate: EstimateTokens,
 ): Span | undefined {
 	// The newest compaction comes first in the projection; its retained tail follows it.
-	const prevIndex = entries.findIndex((e) => e.sourceEntry.type === "compaction" && e.messages.length > 0);
+	const prevIndex = latestCompactionIndex(entries);
 	const start = prevIndex + 1;
 	const previous = prevIndex >= 0 ? (entries[prevIndex].sourceEntry as CompactionEntry) : undefined;
 
@@ -50,13 +57,13 @@ export function planSpan(
 	}
 	if (cut < 0) return undefined; // everything fits in the kept budget
 
-	const messages = entries
-		.slice(start, cut)
+	const covered = entries.slice(start, cut);
+	const messages = covered
 		.filter((e) => e.sourceEntry.type !== "compaction")
 		.flatMap((e) => e.messages);
 	if (messages.length === 0) return undefined;
 
-	return { messages, firstKeptEntryId: entries[cut].sourceEntry.id, previous };
+	return { messages, covered, firstKeptEntryId: entries[cut].sourceEntry.id, previous };
 }
 
 /** One step of the compacted conversation, in order. */
@@ -98,9 +105,14 @@ export function toolSignature(name: string, args: Record<string, unknown>, faile
 	return clip([name, ...parts].join(" "), SIGNATURE_MAX_CHARS) + (failed ? " ✗" : "");
 }
 
-function userText(content: string | readonly { type: string; text?: string }[]): string {
+export function blocksText(content: string | readonly { type: string; text?: string }[]): string {
 	if (typeof content === "string") return content;
 	return content.map((block) => (block.type === "text" ? (block.text ?? "") : `[${block.type}]`)).join("\n");
+}
+
+export function utcMinute(ms: number): string {
+	if (!Number.isFinite(ms)) return "unknown";
+	return `${new Date(ms).toISOString().slice(0, 16).replace("T", " ")}Z`;
 }
 
 /** Deterministic record of the messages being compacted (no model involved). */
@@ -114,7 +126,7 @@ export function extractFacts(messages: readonly AgentMessage[]): Facts {
 
 	for (const message of messages) {
 		if (message.role === "user") {
-			const text = userText(message.content).trim();
+			const text = blocksText(message.content).trim();
 			if (text) events.push({ k: "u", at: message.timestamp, text });
 		} else if (message.role === "assistant") {
 			let prose: string[] = [];

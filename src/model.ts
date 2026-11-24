@@ -39,6 +39,20 @@ export function parseModelKey(key: string): { provider: string; id: string } | u
 
 export const modelKey = (model: { provider: string; id: string }) => `${model.provider}/${model.id}`;
 
+export interface ModelLookup {
+	find(provider: string, id: string): AnyModel | undefined;
+	hasConfiguredAuth(model: AnyModel): boolean;
+}
+
+/** Look up `key` in `registry` and return the model only when it exists and has configured auth. */
+export function findConfiguredModel(registry: ModelLookup, key: string | undefined): AnyModel | undefined {
+	if (!key) return undefined;
+	const parsed = parseModelKey(key);
+	if (!parsed) return undefined;
+	const found = registry.find(parsed.provider, parsed.id);
+	return found && registry.hasConfiguredAuth(found) ? found : undefined;
+}
+
 export interface Summarizer {
 	model: AnyModel;
 	/** Why the configured model was not used, when it was not. */

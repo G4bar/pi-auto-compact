@@ -1,5 +1,5 @@
 import type { CompactionEntry } from "@earendil-works/pi-coding-agent";
-import type { Facts, RecordEvent } from "./span.ts";
+import { type Facts, type RecordEvent, utcMinute } from "./span.ts";
 
 // Checkpoint: a record (user messages and assistant prose verbatim unless shortened, one-line tool
 // signatures) + a model-written state summary + file lists, with the raw transcript left on disk as the
@@ -162,8 +162,6 @@ export interface RenderInput {
 	/** Name of the tool that can search and re-read removed entries; when set, recovery points to it instead of the transcript file. */
 	recallTool?: string;
 }
-
-const utcMinute = (ms: number) => `${new Date(ms).toISOString().slice(0, 16).replace("T", " ")}Z`;
 
 function renderRecord(items: readonly RecordItem[], recallTool?: string): string {
 	const where = recallTool ? `search it with ${recallTool}` : "see the transcript";
