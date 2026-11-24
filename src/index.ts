@@ -5,6 +5,8 @@ import { recordBudgetChars } from "./checkpoint.ts";
 import { isValidPercent, loadConfig, readKeepRecentTokens, saveConfig } from "./config.ts";
 import { THINKING_LEVELS, type ThinkingChoice, isThinkingChoice, modelKey, parseModelKey, resolveThinking } from "./model.ts";
 import { RESUME_MESSAGE, ResumeGuard } from "./resume.ts";
+import { RECALL_TOOL_NAME } from "./recall.ts";
+import { registerRecallTool } from "./recall-tool.ts";
 import { planSpan } from "./span.ts";
 import { buildCheckpoint } from "./summarize.ts";
 
@@ -31,6 +33,9 @@ export default function (pi: ExtensionAPI) {
 	let baseline: number | null = null;
 	let awaitingBaseline = false;
 	const guard = new ResumeGuard();
+	// Name of the recall tool when registered; the checkpoint points to it.
+	const recallTool = config.recall ? RECALL_TOOL_NAME : undefined;
+	if (config.recall) registerRecallTool(pi);
 
 	const thresholdFor = (contextWindow: number) =>
 		Math.max(Math.floor((contextWindow * percent) / 100), config.minTokens);
@@ -83,6 +88,7 @@ export default function (pi: ExtensionAPI) {
 				thinking,
 				sessionThinking: pi.getThinkingLevel(),
 				recordBudgetChars: recordBudgetFor(ctx),
+				recallTool,
 			});
 			if (built.note) notify(ctx, `Auto-compact: ${built.note}`, "warning");
 			if (built.degraded) notify(ctx, `Auto-compact: model summary failed (${built.degraded}); used the deterministic fallback`, "warning");
@@ -148,6 +154,7 @@ export default function (pi: ExtensionAPI) {
 				thinking,
 				sessionThinking: pi.getThinkingLevel(),
 				recordBudgetChars: recordBudgetFor(ctx),
+				recallTool,
 			});
 			if (built.note) notify(ctx, `Compaction: ${built.note}`, "warning");
 			if (built.degraded) notify(ctx, `Compaction: model summary failed (${built.degraded}); used the deterministic fallback`, "warning");
@@ -303,7 +310,7 @@ export default function (pi: ExtensionAPI) {
 			const usage = ctx.getContextUsage();
 			const window = usage?.contextWindow ?? 0;
 			const detail = window ? ` (threshold ${thresholdFor(window)} of ${window} tokens)` : "";
-			notify(ctx, `Auto-compact ${enabled ? "ON" : "OFF"} at ${percent}%${detail}; summaries by ${summarizerKey ?? "the active model"}, thinking ${thinking ?? "off"}`);
+			notify(ctx, `Auto-compact ${enabled ? "ON" : "OFF"} at ${percent}%${detail}; summaries by ${summarizerKey ?? "the active model"}, thinking ${thinking ?? "off"}, recall ${config.recall ? "on" : "off"}`);
 		},
 	});
 }

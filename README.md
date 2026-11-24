@@ -63,7 +63,7 @@ cannot hold) has parts with different guarantees:
 | **Record** | computed by code, no model: user messages `[U1 · time]` and assistant prose `[A]` verbatim (reasoning excluded; non-text user blocks noted as `[image]`, etc.), each tool call as a one-line signature `→ read path="a.ts"` (`✗` = the call failed), all in order | Prose is never reworded. A message over 4k chars keeps head and tail with an inline `[… N chars omitted …]`; long tool signatures are clipped. |
 | **State summary** | model, iterative: updates the previous state instead of re-summarizing a summary | Covers what the record lacks: facts from tool output. Exact values quoted, VERIFIED separated from ASSUMED, truncated output never extrapolated (capped at 30k chars, newest kept). |
 | **File lists** | computed from successful `read`, `edit`, and `write` tool calls (up to 200 each) | `<read-files>`, `<modified-files>` (modified overrides read), flagged as not in context. |
-| **Recovery pointer** | session file path | The raw transcript stays on disk; the checkpoint tells the agent how to search it for removed details (or notes if the session is not persisted). |
+| **Recovery pointer** | the `session_recall` tool, else the session file path | With the [recall tool](#recall-tool) active (default), the checkpoint and the dropped-text stubs tell the agent to use it. Without it, the raw transcript stays on disk and the checkpoint tells the agent how to search it (or notes that the session is not persisted). |
 
 The record is carried forward across compactions, so after several of them it still holds the whole
 conversation, within a budget of a quarter of the compaction threshold (4k–40k tokens). Past it, content is
@@ -83,11 +83,28 @@ What is kept verbatim after the checkpoint follows pi's own rule: about `compact
 newest messages (read from your `settings.json`, including project and per-model overrides), never cutting
 between a tool call and its result.
 
+### Recall tool
+
+A read-only tool, `session_recall`, lets the agent look up what compaction removed instead of grepping the
+session file (inspired by pi-context-kit's `recall`, under a different name so both can coexist). It reads the
+session through pi (`ctx.sessionManager`), so it also works for sessions that are not persisted.
+
+| Call | Effect |
+|---|---|
+| `query` | literal, case-insensitive search over the current branch, newest first, with the entry id and a snippet (±150 chars). `scope`: `"compacted"` (default: only entries no longer in the context) or `"all"` (entries still in context are marked). `limit`: default 10, max 50. |
+| `entryId` | the full text of one entry: a user message, assistant prose with one line per tool call, or a tool result headed by the call that produced it (name and arguments). Paged with `offset` and `maxChars` (default 12,000, max 40,000); the footer says which `offset` continues. |
+
+A tool result also matches on its call's signature, so `path="a.ts"` finds what was read from `a.ts`. Reasoning
+is not recallable, images appear as `[image]`, and output is always capped (at pi's 50 KB limit as a last
+resort). The tool is always active, independent of `/autocompact off`, and costs a short tool description in
+every request; set `"recall": false` in `auto-compact.json` to not register it (the checkpoint then keeps the
+session-file wording).
+
 ## Commands
 
 | Command | Effect |
 |---|---|
-| `/autocompact` / `/autocompact status` | show state, percentage, current threshold, summary model, and thinking level |
+| `/autocompact` / `/autocompact status` | show state, percentage, current threshold, summary model, thinking level, and whether recall is on |
 | `/autocompact 15` | set the percentage (`0 < N < 100`) and enable |
 | `/autocompact on` / `off` | enable / disable for the current session (`off` also disables the resume nudge) |
 | `/autocompact model` | menu to choose the model that writes the summaries, then a menu for its thinking level (skipped if the model has none) |
@@ -118,11 +135,11 @@ Optional `~/.pi/agent/auto-compact.json` (or `$PI_CODING_AGENT_DIR/auto-compact.
 values fall back to these):
 
 ```json
-{ "percent": 20, "minTokens": 40000, "resume": true, "thinking": "off" }
+{ "percent": 20, "minTokens": 40000, "resume": true, "recall": true, "thinking": "off" }
 ```
 
 You can also add `"model": "provider/id"` (e.g. `"anthropic/claude-haiku-5-5"`) to use a dedicated summary
-model by default; omitting it uses the active model. `minTokens` and `resume` are configured in this file
+model by default; omitting it uses the active model. `minTokens`, `resume` and `recall` are configured in this file
 only and preserved when `/autocompact` commands update `percent`, `model`, or `thinking`.
 
 ## Interaction with built-in compaction
@@ -135,8 +152,8 @@ active as a safety net; this extension nearly always fires first. You do not nee
 
 - Each compaction costs one summarization request (active model, or the one set with `/autocompact model`)
   and invalidates the prompt cache, so the next turn pays a cache write. Too low a percentage can cost more than it saves.
-- Compaction is still lossy: tool outputs survive only through the state summary and the raw transcript on
-  disk, and the record is bounded (long messages are shortened, old content is dropped past the budget).
+- Compaction is still lossy: tool outputs survive only through the state summary and what `session_recall`
+  (or the raw transcript on disk) can bring back, and the record is bounded (long messages are shortened, old content is dropped past the budget).
   The checkpoint says so, and the summarizer is told not to extrapolate from truncated tool output.
 - The retention quality of this design has not been benchmarked here; the guarantees above describe what is
   kept, not measured recall.
