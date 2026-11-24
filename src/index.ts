@@ -4,14 +4,11 @@ import type { CompactionEntry, ExtensionAPI, ExtensionCommandContext, ExtensionC
 import { recordBudgetChars } from "./checkpoint.ts";
 import { isValidPercent, loadConfig, readKeepRecentTokens, saveConfig } from "./config.ts";
 import { THINKING_LEVELS, type ThinkingChoice, isThinkingChoice, modelKey, parseModelKey, resolveThinking } from "./model.ts";
+import { growthFor } from "./precompute.ts";
 import { RESUME_MESSAGE, ResumeGuard } from "./resume.ts";
 import { planSpan } from "./span.ts";
 import { buildCheckpoint } from "./summarize.ts";
 
-// After a compaction, the next one needs at least this much new context (or a quarter of the
-// threshold, whichever is larger) on top of the post-compaction size. This is what stops a
-// compaction that leaves the context above the threshold from retriggering on every turn.
-const MIN_GROWTH_TOKENS = 10_000;
 const ACTIVE_MODEL_LABEL = "Active model (default)";
 
 const formatWindow = (tokens: number) =>
@@ -34,7 +31,6 @@ export default function (pi: ExtensionAPI) {
 
 	const thresholdFor = (contextWindow: number) =>
 		Math.max(Math.floor((contextWindow * percent) / 100), config.minTokens);
-	const growthFor = (threshold: number) => Math.max(MIN_GROWTH_TOKENS, Math.floor(threshold / 4));
 	const recordBudgetFor = (ctx: ExtensionContext) => recordBudgetChars(thresholdFor(ctx.model?.contextWindow ?? 128_000));
 
 	const notify = (ctx: ExtensionContext, msg: string, level: "info" | "warning" | "error" = "info") => {
