@@ -48,6 +48,30 @@ Use exactly this format:
 (exact values, snippets and references needed to continue)${focus ? `\n\nAdditional focus: ${focus}` : ""}`;
 }
 
+function pickSummarizer(ctx: ExtensionContext, active: NonNullable<ExtensionContext["model"]>, summarizerKey: string | undefined, neededTokens: number) {
+	const parsed = summarizerKey ? parseModelKey(summarizerKey) : undefined;
+	const found = parsed ? ctx.modelRegistry.find(parsed.provider, parsed.id) : undefined;
+	const configured = found && ctx.modelRegistry.hasConfiguredAuth(found) ? found : undefined;
+	return chooseSummarizer(summarizerKey, configured, active, neededTokens);
+}
+
+/**
+ * Key of the settings a generated state depends on: the summary model and thinking level that would be used
+ * (as resolved now) plus the active model, which is the fallback. A precomputed state is only valid while it is unchanged.
+ */
+export function settingsKey(
+	ctx: ExtensionContext,
+	summarizerKey: string | undefined,
+	thinking: ThinkingChoice | undefined,
+	sessionThinking = "off",
+): string {
+	const active = ctx.model;
+	if (!active) return "no-model";
+	const { model } = pickSummarizer(ctx, active, summarizerKey, 0); // window fit depends on the span, not on the settings
+	const level = resolveThinking(thinking, sessionThinking, getSupportedThinkingLevels(model));
+	return `${modelKey(model)}|${level}|${modelKey(active)}`;
+}
+
 /** One model call that writes (or updates) the state summary. Throws on any failure. */
 async function generateState(
 	ctx: ExtensionContext,
@@ -59,15 +83,10 @@ async function generateState(
 	thinking: ThinkingChoice | undefined,
 	sessionThinking: string,
 ): Promise<{ text: string; usage: Usage; model: string; thinking: string; note?: string }> {
-	const active = ctx.model;
-	if (!active) throw new Error("no model selected");
+	if (!ctx.model) throw new Error("no model selected");
 	const prompt = statePrompt(serializeConversation(convertToLlm([...messages])), previousState, focus);
-
-	const parsed = summarizerKey ? parseModelKey(summarizerKey) : undefined;
-	const found = parsed ? ctx.modelRegistry.find(parsed.provider, parsed.id) : undefined;
-	const configured = found && ctx.modelRegistry.hasConfiguredAuth(found) ? found : undefined;
 	const neededTokens = Math.ceil(prompt.length / 3) + MAX_SUMMARY_TOKENS; // ~3 chars/token: deliberately pessimistic
-	const { model, note } = chooseSummarizer(summarizerKey, configured, active, neededTokens);
+	const { model, note } = pickSummarizer(ctx, ctx.model, summarizerKey, neededTokens);
 
 	// the chosen level, limited to what this model supports (a non-reasoning model gets none)
 	const level = resolveThinking(thinking, sessionThinking, getSupportedThinkingLevels(model));
@@ -138,6 +157,111 @@ export interface Built {
 	note?: string;
 }
 
+/** The slow, model-written part of a checkpoint. */
+export interface Generated {
+	state: string;
+	usage?: Usage;
+	/** Set when the model summary failed and `state` is the deterministic fallback. */
+	degraded?: string;
+	/** Set when the configured summary model could not be used as is. */
+	note?: string;
+	/** `provider/id` that wrote the state (unset when degraded). */
+	model?: string;
+	/** Thinking level actually used (unset when degraded). */
+	thinking?: string;
+}
+
+export interface GenerateInput {
+	ctx: ExtensionContext;
+	/** Messages being replaced, oldest first. */
+	messages: readonly AgentMessage[];
+	/** State text of the compaction this one continues from. */
+	previousState?: string;
+	focus?: string;
+	signal?: AbortSignal;
+	summarizerKey?: string;
+	thinking?: ThinkingChoice;
+	sessionThinking?: string;
+}
+
+/** Write the state summary, retrying with the active model and degrading to a fallback. Only rejects when `signal` aborts. */
+export async function generateStateWithRetry({
+	ctx,
+	messages,
+	previousState,
+	focus,
+	signal,
+	summarizerKey,
+	thinking,
+	sessionThinking = "off",
+}: GenerateInput): Promise<Generated> {
+	let note: string | undefined;
+	for (let attempt = 1; ; attempt++) {
+		try {
+			// a failure with the configured model retries with the active one
+			const generated = await generateState(
+				ctx,
+				messages,
+				previousState,
+				focus,
+				signal,
+				attempt === 1 ? summarizerKey : undefined,
+				thinking,
+				sessionThinking,
+			);
+			return {
+				state: generated.text,
+				usage: generated.usage,
+				note: generated.note ?? note,
+				model: generated.model,
+				thinking: generated.thinking,
+			};
+		} catch (error) {
+			if (signal?.aborted) throw error;
+			const reason = error instanceof Error ? error.message : String(error);
+			if (attempt === 1 && summarizerKey) note = `summary model ${summarizerKey} failed (${reason}); retried with the active model`;
+			if (attempt < ATTEMPTS) continue;
+			return { state: fallbackState(previousState, reason), degraded: reason, note };
+		}
+	}
+}
+
+export interface AssembleInput {
+	/** Session JSONL path; undefined for ephemeral sessions. */
+	sessionFile?: string;
+	messages: readonly AgentMessage[];
+	previous?: CompactionEntry;
+	generated: Generated;
+	recordBudgetChars: number;
+	/** Name of the recall tool, when it is active; the checkpoint then points to it. */
+	recallTool?: string;
+}
+
+/** Everything of a checkpoint except the model call: pure and deterministic. */
+export function assembleCheckpoint({ sessionFile, messages, previous, generated, recordBudgetChars, recallTool }: AssembleInput): Built {
+	const prev = readPrevious(previous);
+	const facts = extractFacts(messages);
+	const state = capState(generated.state);
+	const files = mergeFiles(prev, facts);
+	const record = buildRecord(prev.carried?.record ?? [], facts.events, recordBudgetChars);
+
+	const summary = renderCheckpoint({
+		sessionFile,
+		record,
+		state,
+		readFiles: files.readFiles,
+		modifiedFiles: files.modifiedFiles,
+		recallTool,
+	});
+	return {
+		summary,
+		usage: generated.usage,
+		degraded: generated.degraded,
+		note: generated.note,
+		details: { ...files, checkpoint: { v: 2, state, record } },
+	};
+}
+
 /** Build the checkpoint. Only rejects when `signal` aborts; any other failure degrades. */
 export async function buildCheckpoint({
 	ctx,
@@ -151,52 +275,15 @@ export async function buildCheckpoint({
 	recordBudgetChars,
 	recallTool,
 }: BuildInput): Promise<Built> {
-	const prev = readPrevious(previous);
-	const facts = extractFacts(messages);
-
-	let state: string;
-	let usage: Usage | undefined;
-	let degraded: string | undefined;
-	let note: string | undefined;
-	for (let attempt = 1; ; attempt++) {
-		try {
-			// a failure with the configured model retries with the active one
-			const generated = await generateState(
-				ctx,
-				messages,
-				prev.state,
-				focus,
-				signal,
-				attempt === 1 ? summarizerKey : undefined,
-				thinking,
-				sessionThinking,
-			);
-			state = generated.text;
-			usage = generated.usage;
-			note = generated.note ?? note;
-			break;
-		} catch (error) {
-			if (signal?.aborted) throw error;
-			const reason = error instanceof Error ? error.message : String(error);
-			if (attempt === 1 && summarizerKey) note = `summary model ${summarizerKey} failed (${reason}); retried with the active model`;
-			if (attempt < ATTEMPTS) continue;
-			degraded = reason;
-			state = fallbackState(prev.state, reason);
-			break;
-		}
-	}
-	state = capState(state);
-
-	const files = mergeFiles(prev, facts);
-	const record = buildRecord(prev.carried?.record ?? [], facts.events, recordBudgetChars);
-
-	const summary = renderCheckpoint({
-		sessionFile: ctx.sessionManager.getSessionFile(),
-		record,
-		state,
-		readFiles: files.readFiles,
-		modifiedFiles: files.modifiedFiles,
-		recallTool,
+	const generated = await generateStateWithRetry({
+		ctx,
+		messages,
+		previousState: readPrevious(previous).state,
+		focus,
+		signal,
+		summarizerKey,
+		thinking,
+		sessionThinking,
 	});
-	return { summary, usage, degraded, note, details: { ...files, checkpoint: { v: 2, state, record } } };
+	return assembleCheckpoint({ sessionFile: ctx.sessionManager.getSessionFile(), messages, previous, generated, recordBudgetChars, recallTool });
 }
