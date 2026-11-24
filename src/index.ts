@@ -1,20 +1,24 @@
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { estimateTokens } from "@earendil-works/pi-coding-agent";
-import type { CompactionEntry, ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { recordBudgetChars } from "./checkpoint.ts";
+import type { BoundaryResult, CompactionEntry, ExtensionAPI, ExtensionCommandContext, ExtensionContext, TurnEndEvent } from "@earendil-works/pi-coding-agent";
+import { readPrevious, recordBudgetChars } from "./checkpoint.ts";
 import { isValidPercent, loadConfig, readKeepRecentTokens, saveConfig } from "./config.ts";
 import { THINKING_LEVELS, type ThinkingChoice, isThinkingChoice, modelKey, parseModelKey, resolveThinking } from "./model.ts";
-import { growthFor } from "./precompute.ts";
+import { Precomputer, type Snapshot, aheadKeep, compactAt, createSnapshot, growthFor, leadFor, shouldStart, validateSnapshot } from "./precompute.ts";
 import { RESUME_MESSAGE, ResumeGuard } from "./resume.ts";
 import { RECALL_TOOL_NAME } from "./recall.ts";
 import { registerRecallTool } from "./recall-tool.ts";
 import { planSpan } from "./span.ts";
-import { buildCheckpoint } from "./summarize.ts";
+import { type Built, assembleCheckpoint, buildCheckpoint, generateStateWithRetry, settingsKey } from "./summarize.ts";
 
 const ACTIVE_MODEL_LABEL = "Active model (default)";
 
 const formatWindow = (tokens: number) =>
 	tokens >= 1_000_000 ? `${Number((tokens / 1_000_000).toFixed(2))}M` : `${Math.round(tokens / 1_000)}K`;
+const seconds = (ms: number) => `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
+// A wait shorter than this is reported as "no wait".
+const NO_WAIT_MS = 500;
+const DISCARDED_ENTRY = "auto-compact-discarded";
 
 export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
@@ -33,6 +37,29 @@ export default function (pi: ExtensionAPI) {
 	// Name of the recall tool when registered; the checkpoint points to it.
 	const recallTool = config.recall ? RECALL_TOOL_NAME : undefined;
 	if (config.recall) registerRecallTool(pi);
+
+	// Background summary (opt-in): the state is written while the agent works, so the compaction does not wait for the model.
+	let precompute = config.precompute;
+	// What the running job needs from the turn that started it; read synchronously when it starts.
+	let jobInput: { ctx: ExtensionContext; summarizerKey?: string; thinking?: ThinkingChoice; sessionThinking: string } | undefined;
+	// The snapshot of the running or ready job (the Precomputer does not expose it).
+	let activeSnapshot: Snapshot | undefined;
+	const precomputer = new Precomputer({
+		now: () => Date.now(),
+		run: (snapshot, signal) => {
+			if (!jobInput) throw new Error("no context for the background summary");
+			const { ctx, summarizerKey, thinking, sessionThinking } = jobInput;
+			return generateStateWithRetry({
+				ctx,
+				messages: snapshot.messages,
+				previousState: readPrevious(snapshot.previous).state,
+				signal,
+				summarizerKey,
+				thinking,
+				sessionThinking,
+			});
+		},
+	});
 
 	const thresholdFor = (contextWindow: number) =>
 		Math.max(Math.floor((contextWindow * percent) / 100), config.minTokens);
@@ -55,6 +82,21 @@ export default function (pi: ExtensionAPI) {
 	// applied in place and the agent simply carries on with the compacted context on its next request.
 	pi.on("turn_end", async (event, ctx) => {
 		guard.turnEnded(event.toolResults.length);
+		const result = await compactAtBoundary(event, ctx);
+		// What the background jobs that were thrown away cost: plain entries, appended at the boundary (an
+		// appendEntry in the middle of a turn could land between a tool call and its result).
+		const discarded = precomputer.drainDiscarded();
+		if (discarded.length === 0) return result;
+		return {
+			...result,
+			entries: [
+				...(result?.entries ?? event.entries),
+				...discarded.map(({ usage, reason, model }) => ({ type: "custom" as const, customType: DISCARDED_ENTRY, data: { reason, model, usage } })),
+			],
+		};
+	});
+
+	async function compactAtBoundary(event: TurnEndEvent, ctx: ExtensionContext): Promise<BoundaryResult | undefined> {
 		if (!enabled || event.outcome !== "completed") return;
 		const usage = ctx.getContextUsage();
 		if (!usage || usage.tokens == null || !usage.contextWindow) return;
@@ -65,16 +107,80 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const threshold = thresholdFor(usage.contextWindow);
-		if (usage.tokens <= threshold) return;
-		if (baseline !== null && usage.tokens - baseline < growthFor(threshold)) return;
-
+		const growth = growthFor(threshold);
+		const trigger = compactAt(threshold, baseline, growth);
 		const model = ctx.model ? modelKey(ctx.model) : undefined;
-		const span = planSpan(event.context.contextEntries, readKeepRecentTokens(ctx.cwd, model, ctx.isProjectTrusted()), estimateTokens);
-		if (!span) return;
+		const keepRecent = () => readKeepRecentTokens(ctx.cwd, model, ctx.isProjectTrusted());
+		const entries = event.context.contextEntries;
+		const validate = (snapshot: Snapshot) =>
+			validateSnapshot(snapshot, entries, {
+				settingsKey: settingsKey(ctx, summarizerKey, thinking, pi.getThinkingLevel()),
+				keepRecent: keepRecent(),
+				lead: leadFor(growth),
+				estimate: estimateTokens,
+			});
 
-		notify(ctx, `Auto-compact: ${usage.tokens} tokens > threshold ${threshold} (${percent}%), compacting without stopping the agent`);
-		if (ctx.hasUI) ctx.ui.setWorkingMessage("Compacting context…");
+		if (usage.tokens <= trigger) {
+			if (precompute) maintainPrecompute(ctx, { entries, tokens: usage.tokens, threshold, growth, trigger, keepRecent: keepRecent(), validate });
+			return;
+		}
+
+		// A job still running is awaited: it started before this point, so waiting for it never costs more than a new call.
+		const hasJob = precompute && !["idle", "paused"].includes(precomputer.state());
+		let announced = false;
+		const announce = () => {
+			announced = true;
+			notify(ctx, `Auto-compact: ${usage.tokens} tokens > threshold ${threshold} (${percent}%), compacting without stopping the agent`);
+			if (ctx.hasUI) ctx.ui.setWorkingMessage("Compacting context…");
+		};
+		const appended = (built: Built, firstKeptEntryId: string): BoundaryResult => {
+			compacted();
+			guard.compacted();
+			precomputer.cycleReset();
+			return {
+				entries: [
+					...event.entries,
+					{ type: "compaction" as const, summary: built.summary, firstKeptEntryId, details: built.details, usage: built.usage },
+				],
+			};
+		};
+
 		try {
+			if (hasJob) {
+				announce();
+				const taken = await precomputer.take(ctx.signal);
+				if (taken) {
+					// the wait is over: check again that the snapshot still fits (the branch may have changed meanwhile)
+					const verdict = ctx.signal?.aborted ? ({ ok: false, reason: "the run was aborted" } as const) : validate(taken.snapshot);
+					if (!verdict.ok) {
+						precomputer.discardTaken(taken, verdict.reason);
+						if (ctx.signal?.aborted) return;
+						notify(ctx, `Auto-compact: the background summary was discarded (${verdict.reason}); summarizing now`, "warning");
+					} else {
+						try {
+							const built = assembleCheckpoint({
+								sessionFile: ctx.sessionManager.getSessionFile(),
+								messages: taken.snapshot.messages,
+								previous: taken.snapshot.previous,
+								generated: taken.generated,
+								recordBudgetChars: recordBudgetFor(ctx),
+								recallTool,
+							});
+							if (built.note) notify(ctx, `Auto-compact: ${built.note}`, "warning");
+							const timing = taken.waitedMs < NO_WAIT_MS ? "no wait" : `waited ${seconds(taken.waitedMs)}`;
+							notify(ctx, `Auto-compact: background summary adopted (prepared in ${seconds(taken.preparedMs)} · ${timing})`);
+							return appended(built, taken.snapshot.firstKeptEntryId);
+						} catch (error) {
+							precomputer.discardTaken(taken, `adoption failed: ${error instanceof Error ? error.message : String(error)}`);
+							notify(ctx, "Auto-compact: could not use the background summary; summarizing now", "warning");
+						}
+					}
+				}
+			}
+
+			const span = planSpan(entries, keepRecent(), estimateTokens);
+			if (!span) return;
+			if (!announced) announce();
 			const built = await buildCheckpoint({
 				ctx,
 				messages: span.messages,
@@ -88,28 +194,48 @@ export default function (pi: ExtensionAPI) {
 			});
 			if (built.note) notify(ctx, `Auto-compact: ${built.note}`, "warning");
 			if (built.degraded) notify(ctx, `Auto-compact: model summary failed (${built.degraded}); used the deterministic fallback`, "warning");
-			compacted();
-			guard.compacted();
-			return {
-				entries: [
-					...event.entries,
-					{
-						type: "compaction" as const,
-						summary: built.summary,
-						firstKeptEntryId: span.firstKeptEntryId,
-						details: built.details,
-						usage: built.usage,
-					},
-				],
-			};
+			return appended(built, span.firstKeptEntryId);
 		} catch (error) {
 			if (ctx.signal?.aborted) return;
 			baseline = usage.tokens; // retry only after the context has grown further
 			notify(ctx, `Auto-compact failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 		} finally {
-			if (ctx.hasUI) ctx.ui.setWorkingMessage();
+			if (announced && ctx.hasUI) ctx.ui.setWorkingMessage();
 		}
-	});
+	}
+
+	/** Below the trigger: drop a job whose snapshot no longer fits, and start one when the context is close enough. */
+	function maintainPrecompute(
+		ctx: ExtensionContext,
+		{ entries, tokens, threshold, growth, trigger, keepRecent, validate }: {
+			entries: TurnEndEvent["context"]["contextEntries"];
+			tokens: number;
+			threshold: number;
+			growth: number;
+			trigger: number;
+			keepRecent: number;
+			validate: (snapshot: Snapshot) => ReturnType<typeof validateSnapshot>;
+		},
+	): void {
+		try {
+			if (activeSnapshot && ["running", "ready"].includes(precomputer.state())) {
+				const verdict = validate(activeSnapshot);
+				if (!verdict.ok) precomputer.discard(verdict.reason);
+			}
+			if (!shouldStart({ tokens, threshold, baseline, awaitingBaseline, growth, state: precomputer.state(), budgetExhausted: precomputer.budgetExhausted })) return;
+			const snapshot = createSnapshot(entries, {
+				keep: aheadKeep(keepRecent, tokens, trigger),
+				estimate: estimateTokens,
+				settingsKey: settingsKey(ctx, summarizerKey, thinking, pi.getThinkingLevel()),
+				startedAt: Date.now(),
+			});
+			if (!snapshot) return;
+			jobInput = { ctx, summarizerKey, thinking, sessionThinking: pi.getThinkingLevel() };
+			if (precomputer.start(snapshot)) activeSnapshot = snapshot;
+		} catch (error) {
+			notify(ctx, `Auto-compact: background summary not started (${error instanceof Error ? error.message : String(error)})`, "warning");
+		}
+	}
 
 	pi.on("agent_start", () => guard.reset());
 
@@ -133,6 +259,8 @@ export default function (pi: ExtensionAPI) {
 	// Any compaction (manual /compact, pi's own threshold/overflow safety net) gets the same checkpoint,
 	// so what is recorded and carried forward stays consistent across compactions.
 	pi.on("session_before_compact", async (event, ctx) => {
+		// manual (with focus), overflow and pi's own threshold compactions are computed fresh, never from a snapshot
+		precomputer.discard("pi compaction");
 		const { preparation, branchEntries, customInstructions, signal } = event;
 		const messages = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
 		if (messages.length === 0) return;
@@ -169,7 +297,22 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_compact", compacted);
+	// Whatever was prepared no longer matches the branch after a compaction, a /tree move, a model or thinking
+	// change, or the end of the session (this also aborts the model call of a running job).
+	pi.on("session_compact", () => {
+		compacted();
+		precomputer.cycleReset();
+	});
+	pi.on("session_tree", () => precomputer.discard("session tree navigation"));
+	pi.on("model_select", () => precomputer.discard("active model changed"));
+	pi.on("thinking_level_select", () => {
+		if (thinking === "session") precomputer.discard("session thinking level changed");
+	});
+	pi.on("session_shutdown", () => {
+		precomputer.discard("session shutdown");
+		jobInput = undefined;
+		activeSnapshot = undefined;
+	});
 
 	/** `/autocompact model [provider/id|default]`: no argument opens a menu. */
 	async function chooseModel(ctx: ExtensionCommandContext, requested: string): Promise<void> {
@@ -206,6 +349,7 @@ export default function (pi: ExtensionAPI) {
 		if (choice === undefined) return;
 
 		summarizerKey = choice ?? undefined;
+		precomputer.discard("summary model changed");
 		const err = saveConfig({ model: choice });
 		if (err) notify(ctx, `Could not save the choice (${err}); applies to this session only`, "error");
 		notify(ctx, `Auto-compact summaries will be written by ${summarizerKey ?? "the active model"}`);
@@ -258,6 +402,7 @@ export default function (pi: ExtensionAPI) {
 		if (choice === undefined) return;
 
 		thinking = choice ?? undefined;
+		precomputer.discard("summary thinking changed");
 		const err = saveConfig({ thinking: choice });
 		if (err) notify(ctx, `Could not save the choice (${err}); applies to this session only`, "error");
 		const wanted = thinking === "session" ? session : (thinking ?? "off");
@@ -266,16 +411,26 @@ export default function (pi: ExtensionAPI) {
 		notify(ctx, `Auto-compact summaries will use thinking: ${thinking ?? "off"}${clamp}`);
 	}
 
+	/** `off`, or `on (state)` with the reason the last job was dropped. */
+	function precomputeLabel(): string {
+		if (!precompute) return "off";
+		const { state, lastDiscard } = precomputer.status();
+		return `on (${state}${lastDiscard ? `; last dropped: ${lastDiscard}` : ""})`;
+	}
+
 	pi.registerCommand("autocompact", {
-		description: "Auto-compact: /autocompact [percent|on|off|status|model|think]",
+		description: "Auto-compact: /autocompact [percent|on|off|status|model|think|precompute]",
 		getArgumentCompletions: (prefix) => {
 			const model = /^model\s+(.*)$/i.exec(prefix);
 			const think = /^think\s+(.*)$/i.exec(prefix);
+			const pre = /^precompute\s+(.*)$/i.exec(prefix);
 			const items = model
 				? ["default", ...availableModels].filter((m) => m.startsWith(model[1])).map((m) => ({ value: `model ${m}`, label: m }))
 				: think
 					? ["default", "session", ...THINKING_LEVELS].filter((l) => l.startsWith(think[1].toLowerCase())).map((l) => ({ value: `think ${l}`, label: l }))
-					: ["status", "on", "off", "model", "think"].filter((s) => s.startsWith(prefix.toLowerCase())).map((s) => ({ value: s, label: s }));
+					: pre
+						? ["on", "off"].filter((s) => s.startsWith(pre[1].toLowerCase())).map((s) => ({ value: `precompute ${s}`, label: s }))
+						: ["status", "on", "off", "model", "think", "precompute"].filter((s) => s.startsWith(prefix.toLowerCase())).map((s) => ({ value: s, label: s }));
 			return items.length > 0 ? items : null;
 		},
 		handler: async (args, ctx) => {
@@ -290,23 +445,39 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const arg = args.trim().toLowerCase();
-			if (arg === "off") enabled = false;
-			else if (arg === "on") enabled = true;
+			const pre = /^precompute(?:\s+(\S+))?$/.exec(arg);
+			if (pre) {
+				if (pre[1] !== undefined && pre[1] !== "on" && pre[1] !== "off") {
+					notify(ctx, "Usage: /autocompact precompute [on|off]", "error");
+					return;
+				}
+				if (pre[1]) {
+					precompute = pre[1] === "on";
+					if (precompute) precomputer.resume();
+					else precomputer.discard("precompute turned off");
+					const err = saveConfig({ precompute });
+					if (err) notify(ctx, `Could not save the choice (${err}); applies to this session only`, "error");
+				}
+			} else if (arg === "off") {
+				enabled = false;
+				precomputer.discard("auto-compact turned off");
+			} else if (arg === "on") enabled = true;
 			else if (arg && arg !== "status") {
 				const n = Number(arg.replace("%", ""));
 				if (!isValidPercent(n)) {
-					notify(ctx, "Usage: /autocompact [1-99|on|off|status|model|think]", "error");
+					notify(ctx, "Usage: /autocompact [1-99|on|off|status|model|think|precompute]", "error");
 					return;
 				}
 				percent = n;
 				enabled = true;
+				precomputer.discard("threshold changed");
 				const err = saveConfig({ percent: n });
 				if (err) notify(ctx, `Could not save default (${err}); applies to this session only`, "error");
 			}
 			const usage = ctx.getContextUsage();
 			const window = usage?.contextWindow ?? 0;
 			const detail = window ? ` (threshold ${thresholdFor(window)} of ${window} tokens)` : "";
-			notify(ctx, `Auto-compact ${enabled ? "ON" : "OFF"} at ${percent}%${detail}; summaries by ${summarizerKey ?? "the active model"}, thinking ${thinking ?? "off"}, recall ${config.recall ? "on" : "off"}`);
+			notify(ctx, `Auto-compact ${enabled ? "ON" : "OFF"} at ${percent}%${detail}; summaries by ${summarizerKey ?? "the active model"}, thinking ${thinking ?? "off"}, recall ${config.recall ? "on" : "off"}, precompute ${precomputeLabel()}`);
 		},
 	});
 }
