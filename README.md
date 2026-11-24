@@ -100,19 +100,60 @@ resort). The tool is always active, independent of `/autocompact off`, and costs
 every request; set `"recall": false` in `auto-compact.json` to not register it (the checkpoint then keeps the
 session-file wording).
 
+### Precompute (background summary)
+
+Opt-in (`"precompute": true` or `/autocompact precompute on`; off by default). Without it nothing below changes:
+the checkpoint is built at the trigger and the agent waits for the summary model (up to ~90 s with high thinking).
+With it, the model-written **state summary is prepared in the background while the agent works** (the idea comes
+from pi-precompact (patlux)), so the compaction at the trigger usually does not
+wait for the model at all.
+
+- **When it starts.** On a `turn_end` where the context is within a *lead* of the trigger: `tokens > compactAt − lead`
+  (and not yet above `compactAt`). `compactAt` is the loop-guard limit (`threshold` for the first compaction of a
+  cycle, then `max(threshold, baseline + growth − 1)`), `growth = max(10k, threshold / 4)` and `lead = growth / 2`
+  (5k at a 40k threshold, 25k at 200k). Never while the baseline after a compaction is still being measured.
+  One job at a time, at most 2 per compaction cycle, a 180 s deadline, and a pause after 2 failures (lifted by the
+  next compaction or `/autocompact precompute on`).
+- **What it plans.** A *snapshot*: the span to replace, planned with pi's cut rule, plus a fingerprint (sha256 of the
+  ids and messages it covers). Since the context keeps growing until the trigger, the cut is made early with a
+  smaller verbatim tail, `max(keepRecent − (compactAt − tokens), keepRecent / 2)`, so that the tail at the trigger
+  is about `keepRecent`. Messages added after the snapshot simply stay verbatim; there is no catch-up model call.
+- **At the trigger.** A ready snapshot is adopted: no model call, its `firstKeptEntryId` and the record of its
+  messages go into the compaction entry, and a notification says `prepared in Xs · no wait`. A job still running is
+  awaited (`waited Ys`): it started earlier, so waiting never costs more than a new call. A failed, expired or
+  invalid snapshot falls back to the synchronous path above.
+- **Validation**, before adoption and again after any wait: same previous compaction, the covered entries are an
+  exact prefix of the current ones with the same hash (a `context_edit` or a branch change fails it), the first kept
+  entry still exists, the summary settings (summary model, resolved thinking level, active model) are unchanged,
+  the kept tail is not larger than `keepRecent + lead`, and the state is not the degraded fallback.
+- **What discards it.** A compaction of any kind (`session_compact`), `/tree` navigation, a model change, a session
+  thinking change (only with `/autocompact think session`), session shutdown or reload (the model call is aborted),
+  `/autocompact off`, `model`, `think`, a new percentage or `precompute off`, and pi's own compaction
+  (`session_before_compact`). Manual `/compact` (with focus), context-overflow recovery and pi's threshold
+  compaction never use a snapshot: they compute the checkpoint fresh, as before.
+- **Cost.** A discarded job was paid for without benefit. Its usage is recorded as a `custom` session entry,
+  `auto-compact-discarded` (`{ reason, model, usage }`), at the next turn boundary; pi does not count it in its
+  cost totals. Hence the opt-in default: turn it on once you know your summary model is cheap or you are tired of
+  waiting. `/autocompact status` shows `precompute on (state; last dropped: reason)`.
+- **Other extensions.** It is not compatible with extensions that also replace or precompute the compaction
+  (pi-precompact in particular): only one of them should own `session_before_compact`. Do not enable both.
+
+The background call runs in parallel with the agent's own requests, so it can contribute to provider rate limits.
+
 ## Commands
 
 | Command | Effect |
 |---|---|
-| `/autocompact` / `/autocompact status` | show state, percentage, current threshold, summary model, thinking level, and whether recall is on |
+| `/autocompact` / `/autocompact status` | show state, percentage, current threshold, summary model, thinking level, and whether recall and precompute are on |
 | `/autocompact 15` | set the percentage (`0 < N < 100`) and enable |
 | `/autocompact on` / `off` | enable / disable for the current session (`off` also disables the resume nudge) |
 | `/autocompact model` | menu to choose the model that writes the summaries, then a menu for its thinking level (skipped if the model has none) |
 | `/autocompact model provider/id` | set it directly (`default` / `active` / `reset` = the active model) |
 | `/autocompact think` | menu to choose the thinking level of the summary model |
 | `/autocompact think <level>` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `session` (same as the session) or `default` (= off) |
+| `/autocompact precompute [on\|off]` | enable / disable the [background summary](#precompute-background-summary) (without an argument: show it); `on` also lifts a pause after failures |
 
-`/autocompact N`, `/autocompact model` and `/autocompact think` save to `~/.pi/agent/auto-compact.json` (or
+`/autocompact N`, `/autocompact model`, `/autocompact think` and `/autocompact precompute` save to `~/.pi/agent/auto-compact.json` (or
 `$PI_CODING_AGENT_DIR/auto-compact.json`), so they become the default for all future sessions. `on` / `off`
 last for the current session only.
 
@@ -135,12 +176,13 @@ Optional `~/.pi/agent/auto-compact.json` (or `$PI_CODING_AGENT_DIR/auto-compact.
 values fall back to these):
 
 ```json
-{ "percent": 20, "minTokens": 40000, "resume": true, "recall": true, "thinking": "off" }
+{ "percent": 20, "minTokens": 40000, "resume": true, "recall": true, "precompute": false, "thinking": "off" }
 ```
 
 You can also add `"model": "provider/id"` (e.g. `"anthropic/claude-haiku-5-5"`) to use a dedicated summary
-model by default; omitting it uses the active model. `minTokens`, `resume` and `recall` are configured in this file
-only and preserved when `/autocompact` commands update `percent`, `model`, or `thinking`.
+model by default; omitting it uses the active model. `precompute` is opt-in: only an explicit `true` enables it.
+`minTokens`, `resume` and `recall` are configured in this file only and preserved when `/autocompact` commands
+update `percent`, `model`, `thinking` or `precompute`.
 
 ## Interaction with built-in compaction
 
@@ -152,6 +194,11 @@ active as a safety net; this extension nearly always fires first. You do not nee
 
 - Each compaction costs one summarization request (active model, or the one set with `/autocompact model`)
   and invalidates the prompt cache, so the next turn pays a cache write. Too low a percentage can cost more than it saves.
+- With `precompute` on, a snapshot that is discarded (branch edited, model changed, session closed...) means a
+  summarization request that bought nothing; it is logged in an `auto-compact-discarded` entry. A job that is
+  still running when the session ends is aborted, but its usage may be lost.
+- Precompute has been exercised with a simulated pi in the tests; measuring the wait it saves in a real
+  session is still to be done by hand (`/autocompact precompute on`, then a notification should say `no wait`).
 - Compaction is still lossy: tool outputs survive only through the state summary and what `session_recall`
   (or the raw transcript on disk) can bring back, and the record is bounded (long messages are shortened, old content is dropped past the budget).
   The checkpoint says so, and the summarizer is told not to extrapolate from truncated tool output.
