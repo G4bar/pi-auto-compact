@@ -197,7 +197,8 @@ active as a safety net; this extension nearly always fires first. You do not nee
 - With `precompute` on, a snapshot that is discarded (branch edited, model changed, session closed...) means a
   summarization request that bought nothing; it is logged in an `auto-compact-discarded` entry. A job that is
   still running when the session ends is aborted, but its usage may be lost.
-- Precompute has been exercised with a simulated pi in the tests; measuring the wait it saves in a real
+- Precompute is tested with a faked pi and end to end with the pi SDK and a faux provider (the faux model
+  answers with a configurable delay); measuring the wait it saves with a real provider in a real
   session is still to be done by hand (`/autocompact precompute on`, then a notification should say `no wait`).
 - Compaction is still lossy: tool outputs survive only through the state summary and what `session_recall`
   (or the raw transcript on disk) can bring back, and the record is bounded (long messages are shortened, old content is dropped past the budget).

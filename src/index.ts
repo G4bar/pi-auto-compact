@@ -34,9 +34,9 @@ export default function (pi: ExtensionAPI) {
 	let baseline: number | null = null;
 	let awaitingBaseline = false;
 	const guard = new ResumeGuard();
-	// Name of the recall tool when registered; the checkpoint points to it.
-	const recallTool = config.recall ? RECALL_TOOL_NAME : undefined;
 	if (config.recall) registerRecallTool(pi);
+	// Name of the recall tool when it is registered and active (an allowlist may leave it out); the checkpoint points to it.
+	const recallToolName = (): string | undefined => (config.recall && pi.getActiveTools().includes(RECALL_TOOL_NAME) ? RECALL_TOOL_NAME : undefined);
 
 	// Background summary (opt-in): the state is written while the agent works, so the compaction does not wait for the model.
 	let precompute = config.precompute;
@@ -110,13 +110,16 @@ export default function (pi: ExtensionAPI) {
 		const growth = growthFor(threshold);
 		const trigger = compactAt(threshold, baseline, growth);
 		const model = ctx.model ? modelKey(ctx.model) : undefined;
-		const keepRecent = () => readKeepRecentTokens(ctx.cwd, model, ctx.isProjectTrusted());
+		let keepRecentTokens: number | undefined; // reads the settings files: once per turn
+		const keepRecent = () => (keepRecentTokens ??= readKeepRecentTokens(ctx.cwd, model, ctx.isProjectTrusted()));
 		const entries = event.context.contextEntries;
+		// The kept tail may exceed `keepRecent` by `lead` (at least `keepRecent` itself): a snapshot is not worth
+		// throwing away because one big turn landed after it was prepared; the extra tail simply stays verbatim.
 		const validate = (snapshot: Snapshot) =>
 			validateSnapshot(snapshot, entries, {
 				settingsKey: settingsKey(ctx, summarizerKey, thinking, pi.getThinkingLevel()),
 				keepRecent: keepRecent(),
-				lead: leadFor(growth),
+				lead: Math.max(leadFor(growth), keepRecent()),
 				estimate: estimateTokens,
 			});
 
@@ -125,7 +128,16 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// A job still running is awaited: it started before this point, so waiting for it never costs more than a new call.
+		const warnDiscarded = (reason: string) => notify(ctx, `Auto-compact: the background summary was discarded (${reason}); summarizing now`, "warning");
+		// A job whose snapshot no longer fits is dropped now: waiting for it would cost its remaining time plus a new call.
+		if (precompute && activeSnapshot && ["running", "ready"].includes(precomputer.state())) {
+			const verdict = validate(activeSnapshot);
+			if (!verdict.ok) {
+				precomputer.discard(verdict.reason);
+				warnDiscarded(verdict.reason);
+			}
+		}
+		// A job still running and valid is awaited: it started before this point, so waiting never costs more than a new call.
 		const hasJob = precompute && !["idle", "paused"].includes(precomputer.state());
 		let announced = false;
 		const announce = () => {
@@ -149,32 +161,29 @@ export default function (pi: ExtensionAPI) {
 			if (hasJob) {
 				announce();
 				const taken = await precomputer.take(ctx.signal);
+				if (ctx.signal?.aborted) {
+					if (taken) precomputer.discardTaken(taken, "the run was aborted");
+					return;
+				}
 				if (taken) {
-					// the wait is over: check again that the snapshot still fits (the branch may have changed meanwhile)
-					const verdict = ctx.signal?.aborted ? ({ ok: false, reason: "the run was aborted" } as const) : validate(taken.snapshot);
-					if (!verdict.ok) {
-						precomputer.discardTaken(taken, verdict.reason);
-						if (ctx.signal?.aborted) return;
-						notify(ctx, `Auto-compact: the background summary was discarded (${verdict.reason}); summarizing now`, "warning");
-					} else {
-						try {
-							const built = assembleCheckpoint({
-								sessionFile: ctx.sessionManager.getSessionFile(),
-								messages: taken.snapshot.messages,
-								previous: taken.snapshot.previous,
-								generated: taken.generated,
-								recordBudgetChars: recordBudgetFor(ctx),
-								recallTool,
-							});
-							if (built.note) notify(ctx, `Auto-compact: ${built.note}`, "warning");
-							const timing = taken.waitedMs < NO_WAIT_MS ? "no wait" : `waited ${seconds(taken.waitedMs)}`;
-							notify(ctx, `Auto-compact: background summary adopted (prepared in ${seconds(taken.preparedMs)} · ${timing})`);
-							return appended(built, taken.snapshot.firstKeptEntryId);
-						} catch (error) {
-							precomputer.discardTaken(taken, `adoption failed: ${error instanceof Error ? error.message : String(error)}`);
-							notify(ctx, "Auto-compact: could not use the background summary; summarizing now", "warning");
-						}
+					// the wait is over: check again (same context entries, so this catches a settings change made meanwhile)
+					const verdict = validate(taken.snapshot);
+					if (verdict.ok) {
+						const built = assembleCheckpoint({
+							sessionFile: ctx.sessionManager.getSessionFile(),
+							messages: taken.snapshot.messages,
+							previous: taken.snapshot.previous,
+							generated: taken.generated,
+							recordBudgetChars: recordBudgetFor(ctx),
+							recallTool: recallToolName(),
+						});
+						if (built.note) notify(ctx, `Auto-compact: ${built.note}`, "warning");
+						const timing = taken.waitedMs < NO_WAIT_MS ? "no wait" : `waited ${seconds(taken.waitedMs)}`;
+						notify(ctx, `Auto-compact: background summary adopted (prepared in ${seconds(taken.preparedMs)} · ${timing})`);
+						return appended(built, taken.snapshot.firstKeptEntryId);
 					}
+					precomputer.discardTaken(taken, verdict.reason);
+					warnDiscarded(verdict.reason);
 				}
 			}
 
@@ -190,7 +199,7 @@ export default function (pi: ExtensionAPI) {
 				thinking,
 				sessionThinking: pi.getThinkingLevel(),
 				recordBudgetChars: recordBudgetFor(ctx),
-				recallTool,
+				recallTool: recallToolName(),
 			});
 			if (built.note) notify(ctx, `Auto-compact: ${built.note}`, "warning");
 			if (built.degraded) notify(ctx, `Auto-compact: model summary failed (${built.degraded}); used the deterministic fallback`, "warning");
@@ -278,7 +287,7 @@ export default function (pi: ExtensionAPI) {
 				thinking,
 				sessionThinking: pi.getThinkingLevel(),
 				recordBudgetChars: recordBudgetFor(ctx),
-				recallTool,
+				recallTool: recallToolName(),
 			});
 			if (built.note) notify(ctx, `Compaction: ${built.note}`, "warning");
 			if (built.degraded) notify(ctx, `Compaction: model summary failed (${built.degraded}); used the deterministic fallback`, "warning");

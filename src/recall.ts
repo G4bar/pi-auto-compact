@@ -172,6 +172,23 @@ export function renderHits(hits: readonly Hit[], total: number, scope: SearchSco
 	return lines.join("\n");
 }
 
+/** Byte budget of the text of one page: the tool output is cut at pi's 50 KB, which would drop the footer with the next offset. */
+export const MAX_PAGE_BYTES = 45_000;
+
+/** The largest `end` in `start..end` such that `text.slice(start, end)` takes at most `maxBytes` in UTF-8 (never splits a surrogate pair). */
+function fitBytes(text: string, start: number, end: number, maxBytes: number): number {
+	let bytes = 0;
+	let i = start;
+	while (i < end) {
+		const cp = text.codePointAt(i) ?? 0;
+		const size = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+		if (bytes + size > maxBytes) break;
+		bytes += size;
+		i += cp > 0xffff ? 2 : 1;
+	}
+	return i;
+}
+
 /** One page of an entry: a heading, up to `maxChars` of its text from `offset`, and how to get the next page. */
 export function renderEntryPage(content: EntryText, offset = 0, maxChars?: number): string {
 	const size = clamp(maxChars, MIN_PAGE_CHARS, MAX_PAGE_CHARS, DEFAULT_PAGE_CHARS);
@@ -180,7 +197,7 @@ export function renderEntryPage(content: EntryText, offset = 0, maxChars?: numbe
 	const start = clamp(offset, 0, Number.MAX_SAFE_INTEGER, 0);
 	if (start >= total && total > 0) return `${heading}\n\n[offset ${start} is past the end: the entry has ${total} chars]`;
 
-	const end = Math.min(start + size, total);
+	const end = fitBytes(content.text, start, Math.min(start + size, total), MAX_PAGE_BYTES);
 	const footer = end < total ? `[chars ${start}–${end} of ${total}; call again with offset=${end}]` : `[chars ${start}–${end} of ${total}; end of entry]`;
 	return `${heading}\n\n${content.text.slice(start, end)}\n\n${footer}`;
 }

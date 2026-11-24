@@ -50,7 +50,13 @@ export function registerRecallTool(pi: ExtensionAPI): void {
 
 			if (params.query === undefined) return fail("Pass `query` to search or `entryId` to read an entry.");
 			const scope = params.scope === "all" ? "all" : "compacted"; // StringEnum's static type is not inferred by tsc here
-			const visible = new Set(ctx.sessionManager.buildContextEntries().map((e) => e.id));
+			// entries a context edit omitted are not in the context either: the projection tells which ones contribute messages
+			const visible = new Set(
+				ctx.sessionManager
+					.buildSessionProjection()
+					.entries.filter((e) => e.messages.length > 0)
+					.map((e) => e.sourceEntry.id),
+			);
 			const found = searchEntries(branch, visible, { query: params.query, scope, limit: params.limit });
 			if (typeof found === "string") return fail(found);
 			return ok(renderHits(found.hits, found.total, scope));

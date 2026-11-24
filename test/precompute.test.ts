@@ -370,6 +370,22 @@ test("two failures pause the precompute until cycleReset or resume", async () =>
 	assert.equal(other.precomputer.state(), "idle");
 });
 
+test("the pause counts consecutive failures: a success in between starts the count again", async () => {
+	const { precomputer, calls } = rig({ maxJobsPerCycle: 10 });
+	precomputer.start(fresh());
+	calls[0].reject(new Error("boom"));
+	await tick();
+	precomputer.start(fresh());
+	calls[1].resolve(generated(1)); // success
+	await tick();
+	assert.equal(precomputer.state(), "ready");
+	precomputer.discard("not needed");
+	precomputer.start(fresh());
+	calls[2].reject(new Error("boom")); // one failure since the success: not paused
+	await tick();
+	assert.equal(precomputer.state(), "idle");
+});
+
 test("maxJobsPerCycle is respected and cycleReset restores the budget", async () => {
 	const { precomputer, calls } = rig({ maxJobsPerCycle: 2 });
 	for (let i = 0; i < 2; i++) {

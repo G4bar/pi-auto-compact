@@ -76,6 +76,7 @@ function setup(config: object = {}): Rig {
 		registerCommand: (_name: string, options: unknown) => (command = options),
 		registerTool: () => {},
 		getThinkingLevel: () => "off",
+		getActiveTools: () => ["session_recall"],
 	};
 	const rig: Rig = { calls: [], notes: [], behavior: [], ctx: undefined!, fire: undefined!, command: undefined!, completions: undefined!, turnEnd: undefined! };
 	let tokens = 0;
@@ -371,18 +372,53 @@ test("session_shutdown aborts a running job", async () => {
 	await settle(); // the aborted call settles without an unhandled rejection
 });
 
-test("settings commands discard the snapshot", async () => {
-	for (const args of ["off", "10", "think high", "precompute off"]) {
+test("each settings command discards the snapshot on its own", async () => {
+	for (const args of ["off", "10", "think high", "model default", "precompute off"]) {
 		const rig = await ready();
-		await rig.command(args);
-		await rig.command("on");
-		await rig.command("precompute on");
-		await rig.command("20");
-		const result = await rig.turnEnd(history(44), 41_000);
-		assert.equal(rig.calls.length, 2, args);
-		assert.ok(compactionOf(result), args);
-		assert.equal(discardedOf(result).length, 1, args);
+		await rig.command(args); // one command only: whatever it does, the ready snapshot must be gone
+		await rig.command("precompute on"); // does not discard by itself
+		await rig.command("status");
+		assert.match(rig.notes.at(-1) ?? "", /precompute on \(idle; last dropped/, args);
 	}
+});
+
+test("a job whose snapshot is already invalid is not waited for", async () => {
+	const rig = setup({ precompute: true });
+	rig.behavior.push("manual"); // the job never answers by itself
+	await rig.turnEnd(history(40), 36_000);
+	assert.equal(rig.calls.length, 1);
+	const edited = history(44);
+	edited[1] = entryAt(1, "edited");
+	const result = await rig.turnEnd(edited, 41_000); // would hang if it waited for the job
+	assert.ok(compactionOf(result));
+	assert.equal(rig.calls[0].signal?.aborted, true);
+	assert.equal(rig.calls.length, 2);
+	assert.equal(compactionOf(result).firstKeptEntryId, expectedCut(edited));
+});
+
+test("one big turn after the snapshot was prepared does not waste it", async () => {
+	const rig = await ready(); // snapshot of history(40), keeping AHEAD_KEEP verbatim
+	const result = await rig.turnEnd(history(52), 53_000); // the kept tail grew past keepRecent + lead
+	assert.equal(rig.calls.length, 1); // no new model call
+	assert.equal(compactionOf(result).firstKeptEntryId, expectedCut(history(40), AHEAD_KEEP));
+});
+
+test("a compaction resets the job budget and the pause", async () => {
+	const rig = setup({ precompute: true });
+	rig.behavior.push({ fail: "boom" }, { fail: "boom" }, { fail: "boom" }, { fail: "boom" }); // two failed jobs (two attempts each)
+	await rig.turnEnd(history(40), 36_000);
+	await settle();
+	await rig.turnEnd(history(40), 37_000);
+	await settle();
+	assert.equal(rig.calls.length, 4);
+	await rig.turnEnd(history(40), 38_000);
+	assert.equal(rig.calls.length, 4); // paused after two failures
+
+	assert.ok(compactionOf(await rig.turnEnd(history(44), 41_000))); // synchronous: call 5
+	assert.equal(rig.calls.length, 5);
+	await rig.turnEnd(history(44), 20_000); // the baseline
+	await rig.turnEnd(history(44), 36_000);
+	assert.equal(rig.calls.length, 6); // a job starts again: the pause was lifted by the compaction
 });
 
 // ---------------------------------------------------------------------------------------------------

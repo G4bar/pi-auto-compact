@@ -117,7 +117,7 @@ export interface ValidateInput {
 	/** `settingsKey(...)` now. */
 	settingsKey: string;
 	keepRecent: number;
-	/** `leadFor(growth)`: how much the kept tail may exceed `keepRecent`. */
+	/** How much the kept tail may exceed `keepRecent`. */
 	lead: number;
 	estimate: EstimateTokens;
 }
@@ -363,6 +363,7 @@ export class Precomputer {
 		job.generated = generated;
 		job.readyAt = this.opts.now();
 		job.finished = true;
+		this.failures = 0; // the pause counts consecutive failures
 		this.end(job);
 	}
 

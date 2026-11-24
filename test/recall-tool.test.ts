@@ -15,7 +15,7 @@ const branch = [
 	message("e4", { role: "user", content: "what was the token? SECRET_TOKEN" }),
 	message("e5", { role: "assistant", content: [text("checking")] }),
 ];
-const visible = new Set(["e4", "e5"]);
+let visible = new Set(["e4", "e5"]);
 
 interface Tool {
 	name: string;
@@ -27,7 +27,7 @@ interface Tool {
 function setup() {
 	const tools: Tool[] = [];
 	registerRecallTool({ registerTool: (tool: Tool) => tools.push(tool) } as unknown as ExtensionAPI);
-	const ctx = { sessionManager: { getBranch: () => branch, buildContextEntries: () => branch.filter((e) => visible.has(e.id)) } };
+	const ctx = { sessionManager: { getBranch: () => branch, buildSessionProjection: () => ({ entries: branch.map((e) => ({ sourceEntry: e, messages: visible.has(e.id) ? [{}] : [] })) }) } };
 	const run = (params: Record<string, unknown>) => tools[0].execute("t1", params, undefined, undefined, ctx);
 	return { tools, run };
 }
@@ -83,4 +83,42 @@ test("output never exceeds the byte limit, whatever maxChars asks for", async ()
 	const { run } = setup();
 	const out = (await run({ entryId: "e3", maxChars: 1_000_000 })).content[0].text;
 	assert.ok(Buffer.byteLength(out) < 60 * 1024);
+});
+
+test("multi-byte text is paged by bytes: every page keeps its footer, and the pages add up to the entry", async () => {
+	const cjk = "漢字テスト".repeat(8_000); // 40k chars, 120k bytes
+	branch.push(message("e9", { role: "toolResult", toolCallId: "c9", toolName: "read", content: [text(cjk)], isError: false }));
+	try {
+		const { run } = setup();
+		let offset = 0;
+		let rebuilt = "";
+		for (let page = 0; page < 20; page++) {
+			const out = (await run({ entryId: "e9", offset, maxChars: 40_000 })).content[0].text;
+			assert.ok(Buffer.byteLength(out) < 50 * 1024, "under pi's 50 KB cut");
+			const footer = /\[chars (\d+)–(\d+) of 40000; (call again with offset=(\d+)|end of entry)\]$/.exec(out);
+			assert.ok(footer, "the footer survives");
+			const [, from, to] = footer;
+			assert.equal(Number(from), offset);
+			rebuilt += cjk.slice(offset, Number(to));
+			offset = Number(to);
+			if (offset >= 40_000) break;
+		}
+		assert.equal(rebuilt, cjk.slice(0, rebuilt.length));
+		assert.equal(offset, 40_000);
+	} finally {
+		branch.pop();
+	}
+});
+
+test("an entry a context edit omitted counts as removed from the context", async () => {
+	const before = visible;
+	visible = new Set(["e5"]); // e4 has no messages in the projection
+	try {
+		const { run } = setup();
+		const out = (await run({ query: "what was the token" })).content[0].text;
+		assert.match(out, /\[e4\]/);
+		assert.doesNotMatch(out, /in context/);
+	} finally {
+		visible = before;
+	}
 });
